@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
+use std::collections::HashMap;
 
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::chunk::{Chunk, OpCode};
 use crate::object::{Object, ObjectType, ObjectPtr};
 
@@ -27,6 +28,7 @@ pub struct VM {
     stack: Vec<ObjectPtr>,
     objects: Vec<ObjectPtr>,
     singletons: Vec<ObjectPtr>,
+    globals: HashMap<String, ObjectPtr>,
 }
 
 impl VM {
@@ -37,6 +39,7 @@ impl VM {
             stack: vec![],
             objects: vec![],
             singletons: vec![],
+            globals: HashMap::new(),
         };
 
         for obj in vec![Object::Nil, Object::Bool(true), Object::Bool(false)] {
@@ -47,14 +50,19 @@ impl VM {
         vm
     }
 
-    pub fn interpret(&mut self, chunk: Chunk, mut objects: Vec<ObjectPtr>) -> Result<(), Error> {
+    pub fn interpret(&mut self, chunk: Chunk, mut objects: Vec<ObjectPtr>) -> Result<()> {
         self.chunk = chunk;
         self.index = 0;
         self.stack = vec![];
         self.objects.append(&mut objects);
 
         loop {
-            let byte = self.read_byte();
+            // Return if reached the end of bytecode.
+            let byte = match self.read_byte() {
+                Some(byte) => byte,
+                None => return Ok(()),
+            };
+
             let code = match OpCode::try_from(byte) {
                 Ok(code) => code,
                 Err(_) => return Err(Error::new(
@@ -64,11 +72,7 @@ impl VM {
             };
 
             match code {
-                OpCode::Return => {
-                    let value = self.pop();
-                    self.print_value(&*value);
-                    return Ok(());
-                },
+                OpCode::Return => return Ok(()),
                 OpCode::Constant => {
                     let value = self.read_constant();
                     self.push(value);
@@ -116,6 +120,46 @@ impl VM {
                 },
                 OpCode::Less => binary_op!(self, <, Number, Bool)?,
                 OpCode::Greater => binary_op!(self, >, Number, Bool)?,
+                OpCode::Print => {
+                    let value = self.pop();
+                    self.print_value(&*value);
+                },
+                OpCode::Pop => {
+                    self.pop();
+                },
+                OpCode::DefineGlobal => {
+                    let name = self.read_constant().unwrap_string().clone();
+                    let value = self.pop();
+
+                    self.globals.insert(name, value);
+                },
+                OpCode::GetGlobal => {
+                    let name_constant = self.read_constant();
+                    let name = name_constant.unwrap_string();
+
+                    let value = match self.globals.get(name) {
+                        Some(value) => *value,
+                        None => return Err(Error::new(
+                            format!("Undefined variable {}.", name),
+                            self.chunk.get_line(self.index - 1),
+                        )),
+                    };
+
+                    self.push(value);
+                },
+                OpCode::SetGlobal => {
+                    let name = self.read_constant().unwrap_string().clone();
+                    let value = *self.peek(0);
+
+                    if self.globals.contains_key(&name) {
+                        self.globals.insert(name, value);
+                    } else {
+                        return Err(Error::new(
+                            format!("Undefined variable {}.", name),
+                            self.chunk.get_line(self.index - 1),
+                        ));
+                    }
+                },
             }
         }
     }
@@ -149,15 +193,19 @@ impl VM {
         self.stack.push(value);
     }
 
-    fn read_byte(&mut self) -> u8 {
-        let value = self.chunk.code[self.index];
-        self.index += 1;
-        value
+    fn read_byte(&mut self) -> Option<u8> {
+        if self.index < self.chunk.code.len() {
+            let value = self.chunk.code[self.index];
+            self.index += 1;
+            Some(value)
+        } else {
+            None
+        }
     }
 
     fn read_constant(&mut self) -> ObjectPtr {
-        let index = self.read_byte() as usize;
-        self.chunk.constants[index]
+        let byte = self.read_byte().expect("Constant not encoded.");
+        self.chunk.constants[byte as usize]
     }
 
     fn print_value(&self, object: &Object) {

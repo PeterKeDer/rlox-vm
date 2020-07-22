@@ -32,6 +32,15 @@ macro_rules! generate_object_enum {
                     }
 
                     #[allow(unused_parens)]
+                    pub fn [<take_ $name:lower>](self) -> ($($ty)?) {
+                        if let Object::$name $(([<value_ $ty:snake>]))* = self {
+                            $([<value_ $ty:lower>])*
+                        } else {
+                            panic!("Tried to unwrap {} from type {:?}.", stringify!($name), self.get_type());
+                        }
+                    }
+
+                    #[allow(unused_parens)]
                     pub fn [<as_ $name:lower>](&self) -> Option<&($($ty)?)> {
                         if let Object::$name $(([<value_ $ty:snake>]))* = self {
                             Some(&($([<value_ $ty:lower>])*))
@@ -53,7 +62,7 @@ macro_rules! generate_object_enum {
 }
 
 // This generates the enums `Object` and `ObjectType`.
-// Implements methods `get_type`, `unwrap_<variant>`, and `as_<variant>` for `Object`.
+// Implements methods `get_type`, `unwrap_<variant>`, `take_<variant>`, and `as_<variant>` for `Object`.
 generate_object_enum! {
     Nil,
     Bool(bool),

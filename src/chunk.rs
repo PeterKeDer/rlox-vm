@@ -23,6 +23,11 @@ pub enum OpCode {
     Equal,
     Less,
     Greater,
+    Print,
+    Pop,
+    DefineGlobal,
+    GetGlobal,
+    SetGlobal,
 }
 
 #[derive(Debug)]
@@ -131,6 +136,11 @@ impl Chunk {
                 OpCode::Equal => self.simple_instruction("EQUAL", offset),
                 OpCode::Less => self.simple_instruction("LESS", offset),
                 OpCode::Greater => self.simple_instruction("GREATER", offset),
+                OpCode::Print => self.simple_instruction("PRINT", offset),
+                OpCode::Pop => self.simple_instruction("POP", offset),
+                OpCode::DefineGlobal => self.constant_instruction("DEFINE_GLOBAL", offset),
+                OpCode::GetGlobal => self.constant_instruction("GET_GLOBAL", offset),
+                OpCode::SetGlobal => self.constant_instruction("SET_GLOBAL", offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);

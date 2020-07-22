@@ -90,7 +90,7 @@ parse_rules! {
     GreaterEqual    => (none,       binary,     Comparison  ),
     Less            => (none,       binary,     Comparison  ),
     LessEqual       => (none,       binary,     Comparison  ),
-    Identifier      => (none,       none,       None        ),
+    Identifier      => (variable,   none,       None        ),
     String          => (string,     none,       None        ),
     Number          => (number,     none,       None        ),
     And             => (none,       binary,     And         ),
@@ -112,6 +112,22 @@ parse_rules! {
     EOF             => (none,       none,       None        ),
 }
 
+/// Match a `TokenType`. If any branch matched, `Compiler.advance` is called first.
+macro_rules! match_advance {
+    ( $c:expr, { $( $ty:ident => $expr:expr, )* $( _ => $or_else:expr, )? } ) => {
+        match $c.current().token_type {
+            $(
+                TokenType::$ty => {
+                    $c.advance()?;
+                    $expr
+                },
+            )*
+            $(
+                _ => $or_else,
+            )?
+        }
+    };
+}
 
 pub struct Compiler<'src> {
     scanner: Scanner<'src>,
@@ -119,6 +135,8 @@ pub struct Compiler<'src> {
     current: Option<Token<'src>>,
     previous: Option<Token<'src>>,
     objects: Vec<ObjectPtr>,
+    precedence: Precedence,
+    has_error: bool,
 }
 
 impl Compiler<'_> {
@@ -130,27 +148,102 @@ impl Compiler<'_> {
             current: None,
             previous: None,
             objects: vec![],
+            precedence: Precedence::None,
+            has_error: false,
         };
 
         // This initializes `current` field of `compiler` by calling `next_token` on `scanner`
         compiler.advance()?;
 
-        compiler.expression()?;
+        // Parses and compiles a program
+        compiler.program()?;
 
-        compiler.emit_byte(OpCode::Return as u8);
+        if compiler.has_error {
+            return Err(Error::new("At least one error has occured.".to_string(), 1));
+        }
+
         Ok((compiler.chunk, compiler.objects))
+    }
+
+    fn program(&mut self) -> Result<()> {
+        while !self.match_token(TokenType::EOF)? {
+            self.declaration()?;
+        }
+
+        Ok(())
+    }
+
+    fn declaration(&mut self) -> Result<()> {
+        match self.statement() {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                // TODO: better error handling
+                self.has_error = true;
+                println!("[Error]: {:?}", err);
+                self.synchronize()?;
+                Ok(())
+            },
+        }
+    }
+
+    fn statement(&mut self) -> Result<()> {
+        match_advance!(self, {
+            Var => self.variable_declaration(),
+            Print => self.print_statement(),
+            _ => self.expression_statement(),
+        })
+    }
+
+    fn variable_declaration(&mut self) -> Result<()> {
+        let global = self.parse_variable("Expect variable name.".to_string())?;
+
+        if self.match_token(TokenType::Equal)? {
+            self.expression()?;
+        } else {
+            self.emit_byte(OpCode::Nil as u8);
+        }
+
+        self.consume(TokenType::Semicolon, "Expect ';' after variable declaration.".to_string())?;
+
+        self.define_variable(global);
+
+        Ok(())
+    }
+
+    fn print_statement(&mut self) -> Result<()> {
+        self.expression()?;
+        self.consume(TokenType::Semicolon, "Expect ';' after expression.".to_string())?;
+        self.emit_byte(OpCode::Print as u8);
+        Ok(())
+    }
+
+    fn expression_statement(&mut self) -> Result<()> {
+        self.expression()?;
+        self.consume(TokenType::Semicolon, "Expect ';' after expression.".to_string())?;
+        self.emit_byte(OpCode::Pop as u8);
+        Ok(())
     }
 
     /// Parse anything with given precedence or higher.
     /// Precedence: `precedence` is not `Precedence::None`.
     fn parse_precedence(&mut self, precedence: Precedence) -> Result<()> {
+        let prev_precedence = self.precedence;
+        let result = self.parse_precedence_util(precedence);
+        self.precedence = prev_precedence;
+        result
+    }
+
+    fn parse_precedence_util(&mut self, precedence: Precedence) -> Result<()> {
+        self.precedence = precedence;
         self.advance()?;
         self.parse_prefix(self.previous().token_type)?;
 
         loop {
             let token_type = self.current().token_type;
+            let infix_precedence = self.get_precedence(token_type);
+            self.precedence = infix_precedence;
 
-            if precedence > self.get_precedence(token_type) {
+            if precedence > infix_precedence {
                 // Stop parsing since the next token has lower precedence, or is not an infix operator at all
                 break;
             }
@@ -219,6 +312,10 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    fn variable(&mut self) -> Result<()> {
+        self.named_variable(self.previous().lexeme.iter().collect())
+    }
+
     fn string(&mut self) -> Result<()> {
         let token = self.previous();
 
@@ -252,14 +349,71 @@ impl Compiler<'_> {
         self.emit_byte(byte);
         Ok(())
     }
+
+    /// Emit code to get or set a global variable with name.
+    fn named_variable(&mut self, name: String) -> Result<()> {
+        let constant = self.identifier_constant(name)?;
+
+        if self.precedence <= Precedence::Assignment && self.match_token(TokenType::Equal)? {
+            self.expression()?;
+            self.emit_bytes(OpCode::SetGlobal as u8, constant);
+        } else {
+            self.emit_bytes(OpCode::GetGlobal as u8, constant);
+        }
+
+        Ok(())
+    }
+
+    /// Parse a variable and return the constant address to its name (String).
+    fn parse_variable(&mut self, message: String) -> Result<u8> {
+        self.consume(TokenType::Identifier, message)?;
+        self.identifier_constant(self.previous().lexeme.iter().collect())
+    }
 }
 
 impl<'src> Compiler<'src> {
+    fn synchronize(&mut self) -> Result<()> {
+        while self.current().token_type != TokenType::EOF {
+            if self.previous().token_type == TokenType::Semicolon {
+                return Ok(());
+            }
+
+            match self.current().token_type {
+                TokenType::Class |
+                TokenType::Fun |
+                TokenType::Var |
+                TokenType::For |
+                TokenType::If |
+                TokenType::While |
+                TokenType::Print |
+                TokenType::Return => return Ok(()),
+                _ => (),
+            }
+
+            self.advance()?;
+        }
+
+        Ok(())
+    }
+
     fn advance(&mut self) -> Result<()> {
         let token = self.scanner.next_token()?;
         let prev = mem::replace(&mut self.current, Some(token));
         self.previous = prev;
         Ok(())
+    }
+
+    fn check(&self, token_type: TokenType) -> bool {
+        self.current().token_type == token_type
+    }
+
+    fn match_token(&mut self, token_type: TokenType) -> Result<bool> {
+        if !self.check(token_type) {
+            Ok(false)
+        } else {
+            self.advance()?;
+            Ok(true)
+        }
     }
 
     fn consume(&mut self, token_type: TokenType, message: String) -> Result<()> {
@@ -284,6 +438,29 @@ impl<'src> Compiler<'src> {
         &mut self.chunk
     }
 
+    /// Create an constant that points to an identifier string
+    fn identifier_constant(&mut self, name: String) -> Result<u8> {
+        let ptr = self.alloc(Object::String(name));
+        self.make_constant(ptr)
+    }
+
+    fn define_variable(&mut self, global: u8) {
+        self.emit_bytes(OpCode::DefineGlobal as u8, global);
+    }
+
+    fn make_constant(&mut self, ptr: ObjectPtr) -> Result<u8> {
+        let constant = self.chunk.add_constant(ptr);
+
+        if constant > u8::MAX as usize {
+            Err(Error::new(
+                "Too many constants in one chunk.".to_string(),
+                self.previous().line),
+            )
+        } else {
+            Ok(constant as u8)
+        }
+    }
+
     fn emit_byte(&mut self, byte: u8) {
         let line = self.previous().line;
         self.current_chunk().write(byte, line);
@@ -296,16 +473,8 @@ impl<'src> Compiler<'src> {
 
     fn emit_constant(&mut self, object: Object) -> Result<()> {
         let ptr = self.alloc(object);
-        let constant = self.chunk.add_constant(ptr);
-
-        if constant > u8::MAX as usize {
-            return Err(Error::new(
-                "Too many constants in one chunk.".to_string(),
-                self.previous().line),
-            );
-        }
-
-        self.emit_bytes(OpCode::Constant as u8, constant as u8);
+        let constant = self.make_constant(ptr)?;
+        self.emit_bytes(OpCode::Constant as u8, constant);
         Ok(())
     }
 
