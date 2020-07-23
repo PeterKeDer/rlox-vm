@@ -160,6 +160,15 @@ impl VM {
                         ));
                     }
                 },
+                OpCode::GetLocal => {
+                    let slot = self.read_byte().expect("Expect local slot.") as usize;
+                    self.push(self.stack[slot]);
+                },
+                OpCode::SetLocal => {
+                    let slot = self.read_byte().expect("Expect local slot.") as usize;
+                    // Peek is used here since assignments are also expressions
+                    self.stack[slot] = *self.peek(0);
+                },
             }
         }
     }

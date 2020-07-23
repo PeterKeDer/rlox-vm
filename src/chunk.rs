@@ -28,6 +28,8 @@ pub enum OpCode {
     DefineGlobal,
     GetGlobal,
     SetGlobal,
+    GetLocal,
+    SetLocal,
 }
 
 #[derive(Debug)]
@@ -141,6 +143,9 @@ impl Chunk {
                 OpCode::DefineGlobal => self.constant_instruction("DEFINE_GLOBAL", offset),
                 OpCode::GetGlobal => self.constant_instruction("GET_GLOBAL", offset),
                 OpCode::SetGlobal => self.constant_instruction("SET_GLOBAL", offset),
+                OpCode::GetLocal => self.byte_instruction("GET_LOCAL", offset),
+                OpCode::SetLocal => self.byte_instruction("SET_LOCAL", offset),
+                // OpCode::GetLocal => self.constant_instruction("SET_GLOBAL", offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);
@@ -157,6 +162,12 @@ impl Chunk {
     fn constant_instruction(&self, name: &str, offset: &mut usize) {
         let constant = self.code[*offset + 1];
         println!("{:<16} {:4} '{:?}'", name, constant, self.constants[constant as usize]);
+        *offset += 2
+    }
+
+    fn byte_instruction(&self, name: &str, offset: &mut usize) {
+        let byte = self.code[*offset + 1];
+        println!("{:<16} {:4}", name, byte);
         *offset += 2
     }
 }

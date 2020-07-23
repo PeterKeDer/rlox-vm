@@ -129,11 +129,28 @@ macro_rules! match_advance {
     };
 }
 
+struct Local<'t> {
+    name: Token<'t>,
+    // When depth is None, the local is uninitialized
+    depth: Option<usize>,
+}
+
+impl<'t> Local<'t> {
+    fn new(name: Token<'t>, depth: Option<usize>) -> Local<'t> {
+        Local {
+            name,
+            depth,
+        }
+    }
+}
+
 pub struct Compiler<'src> {
     scanner: Scanner<'src>,
     chunk: Chunk,
     current: Option<Token<'src>>,
     previous: Option<Token<'src>>,
+    locals: Vec<Local<'src>>,
+    scope_depth: usize,
     objects: Vec<ObjectPtr>,
     precedence: Precedence,
     has_error: bool,
@@ -147,6 +164,8 @@ impl Compiler<'_> {
             chunk: Chunk::new(),
             current: None,
             previous: None,
+            locals: vec![],
+            scope_depth: 0,
             objects: vec![],
             precedence: Precedence::None,
             has_error: false,
@@ -190,8 +209,22 @@ impl Compiler<'_> {
         match_advance!(self, {
             Var => self.variable_declaration(),
             Print => self.print_statement(),
+            LeftBrace => self.block(),
             _ => self.expression_statement(),
         })
+    }
+
+    fn block(&mut self) -> Result<()> {
+        self.begin_scope();
+
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::EOF) {
+            self.declaration()?;
+        }
+
+        self.consume(TokenType::RightBrace, "Expect '}' after block.".to_string())?;
+        self.end_scope();
+
+        Ok(())
     }
 
     fn variable_declaration(&mut self) -> Result<()> {
@@ -313,7 +346,7 @@ impl Compiler<'_> {
     }
 
     fn variable(&mut self) -> Result<()> {
-        self.named_variable(self.previous().lexeme.iter().collect())
+        self.named_variable(self.previous())
     }
 
     fn string(&mut self) -> Result<()> {
@@ -351,14 +384,17 @@ impl Compiler<'_> {
     }
 
     /// Emit code to get or set a global variable with name.
-    fn named_variable(&mut self, name: String) -> Result<()> {
-        let constant = self.identifier_constant(name)?;
+    fn named_variable(&mut self, name: Token<'_>) -> Result<()> {
+        let (get_op, set_op, arg) = match self.resolve_local(name)? {
+            Some(index) => (OpCode::GetLocal, OpCode::SetLocal, index as u8),
+            None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.iter().collect())?),
+        };
 
         if self.precedence <= Precedence::Assignment && self.match_token(TokenType::Equal)? {
             self.expression()?;
-            self.emit_bytes(OpCode::SetGlobal as u8, constant);
+            self.emit_bytes(set_op as u8, arg);
         } else {
-            self.emit_bytes(OpCode::GetGlobal as u8, constant);
+            self.emit_bytes(get_op as u8, arg);
         }
 
         Ok(())
@@ -367,6 +403,12 @@ impl Compiler<'_> {
     /// Parse a variable and return the constant address to its name (String).
     fn parse_variable(&mut self, message: String) -> Result<u8> {
         self.consume(TokenType::Identifier, message)?;
+
+        self.declare_variable()?;
+        if self.scope_depth > 0 {
+            return Ok(0);
+        }
+
         self.identifier_constant(self.previous().lexeme.iter().collect())
     }
 }
@@ -394,6 +436,30 @@ impl<'src> Compiler<'src> {
         }
 
         Ok(())
+    }
+
+    fn begin_scope(&mut self) {
+        self.scope_depth += 1;
+    }
+
+    fn end_scope(&mut self) {
+        self.scope_depth -= 1;
+
+        // Pop all local variables from last scope
+        while !self.locals.is_empty() {
+            if let Some(depth) = self.locals.last().unwrap().depth {
+                if depth <= self.scope_depth {
+                    // Stop popping variables from this scope or lower
+                    break;
+                }
+            } else {
+                // No depth: uninitialized variable
+                break;
+            }
+
+            self.locals.pop();
+            self.emit_byte(OpCode::Pop as u8);
+        }
     }
 
     fn advance(&mut self) -> Result<()> {
@@ -444,8 +510,71 @@ impl<'src> Compiler<'src> {
         self.make_constant(ptr)
     }
 
+    fn declare_variable(&mut self) -> Result<()> {
+        if self.scope_depth == 0 {
+            // Global variables are implicitly declared
+            return Ok(());
+        }
+
+        let name = self.previous();
+
+        for local in self.locals.iter().rev() {
+            if let Some(depth) = local.depth {
+                if depth < self.scope_depth {
+                    break;
+                }
+            }
+
+            if name.lexeme == local.name.lexeme {
+                return Err(Error::new(
+                    format!("Variable with name '{}' already declared in the scope.", name.lexeme.iter().collect::<String>()),
+                    name.line,
+                ));
+            }
+        }
+
+        self.add_local(name)?;
+        Ok(())
+    }
+
+    fn add_local(&mut self, name: Token<'src>) -> Result<()> {
+        // There are a max number of local variables (for now) since bytecode are u8
+        if self.locals.len() > u8::MAX as usize {
+            return Err(Error::new(
+                "Too many local variables.".to_string(),
+                name.line,
+            ));
+        }
+
+        let local = Local::new(name, None);
+        self.locals.push(local);
+        Ok(())
+    }
+
+    fn resolve_local(&mut self, name: Token<'_>) -> Result<Option<usize>> {
+        for (index, local) in self.locals.iter().enumerate().rev() {
+            if name.lexeme == local.name.lexeme {
+                if local.depth.is_none() {
+                    return Err(Error::new(
+                        format!("Cannot use variable '{}' in its own initializer.", name.lexeme.iter().collect::<String>()),
+                        name.line,
+                    ));
+                } else {
+                    return Ok(Some(index));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn define_variable(&mut self, global: u8) {
-        self.emit_bytes(OpCode::DefineGlobal as u8, global);
+        if self.scope_depth > 0 {
+            // Local variable, mark as initialized
+            self.locals.last_mut().expect("Expect declared local variable.").depth = Some(self.scope_depth);
+        } else {
+            self.emit_bytes(OpCode::DefineGlobal as u8, global);
+        }
     }
 
     fn make_constant(&mut self, ptr: ObjectPtr) -> Result<u8> {
