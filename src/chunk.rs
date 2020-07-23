@@ -30,6 +30,8 @@ pub enum OpCode {
     SetGlobal,
     GetLocal,
     SetLocal,
+    Jump,
+    JumpIfFalse,
 }
 
 #[derive(Debug)]
@@ -145,7 +147,8 @@ impl Chunk {
                 OpCode::SetGlobal => self.constant_instruction("SET_GLOBAL", offset),
                 OpCode::GetLocal => self.byte_instruction("GET_LOCAL", offset),
                 OpCode::SetLocal => self.byte_instruction("SET_LOCAL", offset),
-                // OpCode::GetLocal => self.constant_instruction("SET_GLOBAL", offset),
+                OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
+                OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);
@@ -169,5 +172,12 @@ impl Chunk {
         let byte = self.code[*offset + 1];
         println!("{:<16} {:4}", name, byte);
         *offset += 2
+    }
+
+    fn jump_instruction(&self, name: &str, sign: i32, offset: &mut usize) {
+        let jump = ((self.code[*offset + 1] as u16) << 8) | self.code[*offset + 2] as u16;
+        let end = *offset as i32 + 3 + (jump as i32) * sign;
+        println!("{:<16} {:4} -> {:4}", name, offset, end);
+        *offset += 3
     }
 }

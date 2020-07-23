@@ -209,6 +209,7 @@ impl Compiler<'_> {
         match_advance!(self, {
             Var => self.variable_declaration(),
             Print => self.print_statement(),
+            If => self.if_statement(),
             LeftBrace => self.block(),
             _ => self.expression_statement(),
         })
@@ -247,6 +248,38 @@ impl Compiler<'_> {
         self.expression()?;
         self.consume(TokenType::Semicolon, "Expect ';' after expression.".to_string())?;
         self.emit_byte(OpCode::Print as u8);
+
+        Ok(())
+    }
+
+    fn if_statement(&mut self) -> Result<()> {
+        self.consume(TokenType::LeftParen, "Expect '(' after 'if'.".to_string())?;
+        self.expression()?;
+        self.consume(TokenType::RightParen, "Expect ')' after condition.".to_string())?;
+
+        // Jump to else branch
+        let then_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+
+        // Pop value remaining from jump, if condition is true
+        self.emit_byte(OpCode::Pop as u8);
+
+        // Then branch
+        self.statement()?;
+
+        // Jump before else branch to the end
+        let else_jump = self.emit_jump(OpCode::Jump as u8);
+        self.patch_jump(then_jump)?;
+
+        // Pop value remaining from jump, if condition is false
+        self.emit_byte(OpCode::Pop as u8);
+
+        if self.match_token(TokenType::Else)? {
+            // Else branch
+            self.statement()?;
+        }
+
+        self.patch_jump(else_jump)?;
+
         Ok(())
     }
 
@@ -604,6 +637,29 @@ impl<'src> Compiler<'src> {
         let ptr = self.alloc(object);
         let constant = self.make_constant(ptr)?;
         self.emit_bytes(OpCode::Constant as u8, constant);
+        Ok(())
+    }
+
+    fn emit_jump(&mut self, instruction: u8) -> usize {
+        self.emit_byte(instruction);
+        self.emit_bytes(0, 0);
+        self.current_chunk().code.len() - 2
+    }
+
+    fn patch_jump(&mut self, offset: usize) -> Result<()> {
+        // -2 to adjust for bytecode for jump offset itself
+        let jump = self.current_chunk().code.len() - offset - 2;
+
+        if jump > u16::MAX as usize {
+            return Err(Error::new(
+                "Too much code to jump over.".to_string(),
+                self.current_chunk().get_line(offset),
+            ));
+        }
+
+        self.current_chunk().code[offset] = (jump >> 8) as u8;
+        self.current_chunk().code[offset + 1] = jump as u8;
+
         Ok(())
     }
 

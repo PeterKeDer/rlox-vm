@@ -169,6 +169,16 @@ impl VM {
                     // Peek is used here since assignments are also expressions
                     self.stack[slot] = *self.peek(0);
                 },
+                OpCode::Jump => {
+                    let offset = self.read_short() as usize;
+                    self.index += offset;
+                },
+                OpCode::JumpIfFalse => {
+                    let offset = self.read_short() as usize;
+                    if is_falsey(self.peek(0)) {
+                        self.index += offset;
+                    }
+                },
             }
         }
     }
@@ -210,6 +220,12 @@ impl VM {
         } else {
             None
         }
+    }
+
+    fn read_short(&mut self) -> u16 {
+        let value = ((self.chunk.code[self.index] as u16) << 8) | self.chunk.code[self.index + 1] as u16;
+        self.index += 2;
+        value
     }
 
     fn read_constant(&mut self) -> ObjectPtr {
