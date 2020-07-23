@@ -179,6 +179,10 @@ impl VM {
                         self.index += offset;
                     }
                 },
+                OpCode::Loop => {
+                    let offset = self.read_short() as usize;
+                    self.index -= offset;
+                }
             }
         }
     }

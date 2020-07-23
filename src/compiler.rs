@@ -93,7 +93,7 @@ parse_rules! {
     Identifier      => (variable,   none,       None        ),
     String          => (string,     none,       None        ),
     Number          => (number,     none,       None        ),
-    And             => (none,       binary,     And         ),
+    And             => (none,       and,        And         ),
     Class           => (none,       none,       None        ),
     Else            => (none,       none,       None        ),
     False           => (literal,    none,       None        ),
@@ -101,7 +101,7 @@ parse_rules! {
     Fun             => (none,       none,       None        ),
     If              => (none,       none,       None        ),
     Nil             => (literal,    none,       None        ),
-    Or              => (none,       binary,     Or          ),
+    Or              => (none,       or,         Or          ),
     Print           => (none,       none,       None        ),
     Return          => (none,       none,       None        ),
     Super           => (none,       none,       None        ),
@@ -210,6 +210,8 @@ impl Compiler<'_> {
             Var => self.variable_declaration(),
             Print => self.print_statement(),
             If => self.if_statement(),
+            While => self.while_statement(),
+            For => self.for_statement(),
             LeftBrace => self.block(),
             _ => self.expression_statement(),
         })
@@ -279,6 +281,92 @@ impl Compiler<'_> {
         }
 
         self.patch_jump(else_jump)?;
+
+        Ok(())
+    }
+
+    fn while_statement(&mut self) -> Result<()> {
+        let loop_start = self.current_chunk().code.len();
+
+        self.consume(TokenType::LeftParen, "Expect '(' after 'while'.".to_string())?;
+        self.expression()?;
+        self.consume(TokenType::RightParen, "Expect ')' after condition.".to_string())?;
+
+        // Jump to exit the loop if condition is false
+        let exit_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+
+        self.emit_byte(OpCode::Pop as u8);
+        self.statement()?;
+
+        self.emit_loop(loop_start)?;
+
+        self.patch_jump(exit_jump)?;
+        self.emit_byte(OpCode::Pop as u8);
+
+        Ok(())
+    }
+
+    fn for_statement(&mut self) -> Result<()> {
+        // Note that for loop will create an addition scope (for the potential new variable)
+        self.begin_scope();
+
+        self.consume(TokenType::LeftParen, "Expect '(' after 'for'.".to_string())?;
+
+        // Match nothing, variable declaration, or an expression
+        match_advance!(self, {
+            Semicolon => Ok(()),
+            Var => self.variable_declaration(),
+            _ => self.expression_statement(),
+        })?;
+
+        // The place to jump back for each loop iteration
+        let mut loop_start = self.current_chunk().code.len();
+
+        // Match optional loop condition
+        let mut exit_jump = None;
+        if !self.match_token(TokenType::Semicolon)? {
+            self.expression()?;
+            self.consume(TokenType::Semicolon, "Expect ';' after loop condition.".to_string())?;
+
+            // Exit when condition is false
+            exit_jump = Some(self.emit_jump(OpCode::JumpIfFalse as u8));
+
+            // Pop condition value
+            self.emit_byte(OpCode::Pop as u8);
+        }
+
+        // Match optional increment clause
+        if !self.match_token(TokenType::RightParen)? {
+            // Increment clause is executed after the loop, so jump to execute body first
+            let body_jump = self.emit_jump(OpCode::Jump as u8);
+
+            // Record location to jump to increment clause
+            let loop_increment = self.current_chunk().code.len();
+
+            self.expression()?;
+            self.emit_byte(OpCode::Pop as u8);
+            self.consume(TokenType::RightParen, "Expect ')' after for clauses.".to_string())?;
+
+            // Jump back to condition after executing clause
+            self.emit_loop(loop_start)?;
+
+            // Change loop start to jump to increment clause
+            loop_start = loop_increment;
+
+            self.patch_jump(body_jump)?;
+        }
+
+        self.statement()?;
+
+        // Jump to loop start, whether it be increment clause or condition
+        self.emit_loop(loop_start)?;
+
+        if let Some(jump) = exit_jump {
+            self.patch_jump(jump)?;
+            self.emit_byte(OpCode::Pop as u8);
+        }
+
+        self.end_scope();
 
         Ok(())
     }
@@ -378,16 +466,45 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    fn and(&mut self) -> Result<()> {
+        // The `and` operator evaluates to the left side if it is falsey, otherwise the right side
+        // Jump to end if the value is falsey
+        let end_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+
+        // If did not jump to end, the bool value is no longer needed
+        self.emit_byte(OpCode::Pop as u8);
+
+        self.parse_precedence(Precedence::And)?;
+        self.patch_jump(end_jump)?;
+
+        Ok(())
+    }
+
+    fn or(&mut self) -> Result<()> {
+        // The `or` operator evaluates to the left side if it is truthy, otherwise the right side
+        // If value is falsey, expression
+        let else_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+
+        // Jump to end since value is truthy
+        let end_jump = self.emit_jump(OpCode::Jump as u8);
+
+        self.patch_jump(else_jump)?;
+        self.emit_byte(OpCode::Pop as u8);
+
+        self.parse_precedence(Precedence::Or)?;
+        self.patch_jump(end_jump)?;
+
+        Ok(())
+    }
+
     fn variable(&mut self) -> Result<()> {
         self.named_variable(self.previous())
     }
 
     fn string(&mut self) -> Result<()> {
         let token = self.previous();
-
         let string = token.lexeme[1..token.lexeme.len() - 1].iter().collect();
         let value = Object::String(string);
-
         self.emit_constant(value)?;
         Ok(())
     }
@@ -659,6 +776,23 @@ impl<'src> Compiler<'src> {
 
         self.current_chunk().code[offset] = (jump >> 8) as u8;
         self.current_chunk().code[offset + 1] = jump as u8;
+
+        Ok(())
+    }
+
+    fn emit_loop(&mut self, loop_start: usize) -> Result<()> {
+        self.emit_byte(OpCode::Loop as u8);
+
+        let jump = self.current_chunk().code.len() - loop_start + 2;
+
+        if jump > u16::MAX as usize {
+            return Err(Error::new(
+                "Loop body too large.".to_string(),
+                self.current_chunk().get_line(loop_start),
+            ));
+        }
+
+        self.emit_bytes((jump >> 8) as u8, jump as u8);
 
         Ok(())
     }

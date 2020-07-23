@@ -32,6 +32,7 @@ pub enum OpCode {
     SetLocal,
     Jump,
     JumpIfFalse,
+    Loop,
 }
 
 #[derive(Debug)]
@@ -149,6 +150,7 @@ impl Chunk {
                 OpCode::SetLocal => self.byte_instruction("SET_LOCAL", offset),
                 OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
                 OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
+                OpCode::Loop => self.jump_instruction("LOOP", -1, offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);
