@@ -486,7 +486,7 @@ impl Parser<'_, '_> {
 
     fn string(&mut self) -> Result<()> {
         let token = self.previous();
-        let string = token.lexeme[1..token.lexeme.len() - 1].iter().collect();
+        let string = token.lexeme[1..token.lexeme.len() - 1].to_string();
         let value = Object::String(string);
         self.emit_constant(value)?;
         Ok(())
@@ -495,7 +495,7 @@ impl Parser<'_, '_> {
     fn number(&mut self) -> Result<()> {
         let token = self.previous();
 
-        let value = token.lexeme.iter().collect::<String>()
+        let value = token.lexeme
             .parse()
             .map(Object::Number)
             .map_err(|_| Error::new("Cannot parse float.".to_string(), token.line))?;
@@ -520,7 +520,7 @@ impl Parser<'_, '_> {
     fn named_variable(&mut self, name: Token<'_>) -> Result<()> {
         let (get_op, set_op, arg) = match self.resolve_local(name)? {
             Some(index) => (OpCode::GetLocal, OpCode::SetLocal, index as u8),
-            None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.iter().collect())?),
+            None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.to_string())?),
         };
 
         if self.precedence <= Precedence::Assignment && self.match_token(TokenType::Equal)? {
@@ -542,7 +542,7 @@ impl Parser<'_, '_> {
             return Ok(0);
         }
 
-        self.identifier_constant(self.previous().lexeme.iter().collect())
+        self.identifier_constant(self.previous().lexeme.to_string())
     }
 }
 
@@ -658,9 +658,9 @@ impl<'src> Parser<'src, '_> {
                 }
             }
 
-            if name.lexeme == local.name.lexeme {
+            if name.lexeme == local.name {
                 return Err(Error::new(
-                    format!("Variable with name '{}' already declared in the scope.", name.lexeme.iter().collect::<String>()),
+                    format!("Variable with name '{}' already declared in the scope.", name.lexeme),
                     name.line,
                 ));
             }
@@ -679,17 +679,17 @@ impl<'src> Parser<'src, '_> {
             ));
         }
 
-        let local = Local::new(name, None);
+        let local = Local::new(name.lexeme, None);
         self.compiler.locals.push(local);
         Ok(())
     }
 
     fn resolve_local(&mut self, name: Token<'_>) -> Result<Option<usize>> {
         for (index, local) in self.compiler.locals.iter().enumerate().rev() {
-            if name.lexeme == local.name.lexeme {
+            if name.lexeme == local.name {
                 if local.depth.is_none() {
                     return Err(Error::new(
-                        format!("Cannot use variable '{}' in its own initializer.", name.lexeme.iter().collect::<String>()),
+                        format!("Cannot use variable '{}' in its own initializer.", name.lexeme),
                         name.line,
                     ));
                 } else {

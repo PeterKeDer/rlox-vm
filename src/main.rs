@@ -2,7 +2,6 @@ use std::{env, io};
 use std::fs::File;
 use std::io::{Read, Write};
 
-use rlox_vm::chunk::Chunk;
 use rlox_vm::vm::VM;
 use rlox_vm::scanner::Scanner;
 use rlox_vm::parser::Parser;
@@ -12,7 +11,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let app = App {
-        vm: VM::new(Chunk::new(), DefaultAllocator::new()),
+        vm: VM::new(DefaultAllocator::new()),
     };
 
     match args.len() {
@@ -55,15 +54,12 @@ impl App {
     }
 
     fn run(&mut self, source: String) {
-        let source: Vec<char> = source.chars().collect();
         let scanner = Scanner::new(&source);
 
         match Parser::compile(scanner, &mut self.vm.allocator) {
             Ok(function) => {
-                let chunk = function.chunk;
-                chunk.disassemble("Test");
-                // TODO: make vm also use allocator
-                let result = self.vm.interpret(chunk);
+                function.chunk.disassemble("Test");
+                let result = self.vm.interpret(function);
                 println!("Interpret result: {:?}", result);
             },
             Err(error) => println!("Error [{}]: {}", error.line, error.message),

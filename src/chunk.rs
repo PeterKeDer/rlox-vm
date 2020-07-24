@@ -35,7 +35,7 @@ pub enum OpCode {
     Loop,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Chunk {
     pub code: Vec<u8>,
     pub constants: Vec<ObjectPtr>,

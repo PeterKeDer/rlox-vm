@@ -1,18 +1,24 @@
-use crate::scanner::Token;
 use crate::chunk::Chunk;
 use crate::object::{Function, FunctionType};
 
-pub struct Local<'t> {
-    pub name: Token<'t>,
+pub struct Local<'s> {
+    pub name: &'s str,
     // When depth is None, the local is uninitialized
     pub depth: Option<usize>,
 }
 
-impl<'t> Local<'t> {
-    pub fn new(name: Token<'t>, depth: Option<usize>) -> Local<'t> {
+impl<'s> Local<'s> {
+    pub fn new(name: &'s str, depth: Option<usize>) -> Local<'s> {
         Local {
             name,
             depth,
+        }
+    }
+
+    fn placeholder() -> Local<'static> {
+        Local {
+            name: "",
+            depth: Some(0),
         }
     }
 }
@@ -26,8 +32,11 @@ pub struct Compiler<'src> {
 
 impl<'src> Compiler<'src> {
     pub fn new(function_type: FunctionType) -> Compiler<'src> {
+        // The placeholder is reserved for the VM to put the function being executed
+        let locals = vec![Local::placeholder()];
+
         Compiler {
-            locals: vec![],
+            locals,
             scope_depth: 0,
             function: Function::new(None, 0, Chunk::new()),
             function_type,

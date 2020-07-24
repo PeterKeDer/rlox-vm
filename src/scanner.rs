@@ -4,12 +4,12 @@ use crate::error::Error;
 #[derive(Debug, Copy, Clone)]
 pub struct Token<'lex> {
     pub token_type: TokenType,
-    pub lexeme: &'lex [char],
+    pub lexeme: &'lex str,
     pub line: usize,
 }
 
 impl Token<'_> {
-    fn new(token_type: TokenType, lexeme: &[char], line: usize) -> Token<'_> {
+    fn new(token_type: TokenType, lexeme: &str, line: usize) -> Token<'_> {
         Token {
             token_type,
             lexeme,
@@ -45,16 +45,18 @@ pub enum TokenType {
 }
 
 pub struct Scanner<'src> {
-    source: &'src [char],
+    source: &'src str,
+    chars: Vec<char>,
     start: usize,
     current: usize,
     line: usize,
 }
 
 impl<'src> Scanner<'src> {
-    pub fn new(source: &'src [char]) -> Scanner<'src> {
+    pub fn new(source: &'src str) -> Scanner<'src> {
         Scanner {
             source,
+            chars: source.chars().collect(),
             start: 0,
             current: 0,
             line: 1,
@@ -152,8 +154,8 @@ impl<'src> Scanner<'src> {
         }
 
         // Check if identifier is reserved.
-        let lexeme_slice: String = self.source[self.start..self.current].iter().collect();
-        let token_type = match KEYWORD_TOKENS.get(&lexeme_slice) {
+        let lexeme_slice = &self.source[self.start..self.current];
+        let token_type = match KEYWORD_TOKENS.get(lexeme_slice) {
             Some(v) => *v,
             None => TokenType::Identifier,
         };
@@ -167,16 +169,16 @@ impl<'src> Scanner<'src> {
     }
 
     fn is_at_end(&self) -> bool {
-        self.current >= self.source.len()
+        self.current >= self.chars.len()
     }
 
     fn advance(&mut self) -> char {
         self.current += 1;
-        self.source[self.current - 1]
+        self.chars[self.current - 1]
     }
 
     fn match_char(&mut self, expected: char) -> bool {
-        if self.is_at_end() || self.source[self.current] != expected {
+        if self.is_at_end() || self.chars[self.current] != expected {
              false
         } else {
             self.current += 1;
@@ -188,15 +190,15 @@ impl<'src> Scanner<'src> {
         if self.is_at_end() {
             '\0'
         } else {
-            self.source[self.current]
+            self.chars[self.current]
         }
     }
 
     fn peek_next(&self) -> char {
-        if self.current + 1 >= self.source.len() {
+        if self.current + 1 >= self.chars.len() {
             '\0'
         } else {
-            self.source[self.current + 1]
+            self.chars[self.current + 1]
         }
     }
 

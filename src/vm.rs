@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, OpCode};
-use crate::object::{Object, ObjectType, ObjectPtr};
+use crate::object::{Object, ObjectType, ObjectPtr, Function};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -16,33 +16,43 @@ macro_rules! binary_op {
                 (Object::$ident_ty(a), Object::$ident_ty(b)) => Ok($vm.alloc_push(Object::$res_ty(*a $op *b))),
                 _ => Err(Error::new(
                     format!("The operator '{}' can only be used on two numbers.", stringify!($op)),
-                    $vm.chunk.get_line($vm.index),
+                    $vm.chunk().get_line($vm.index()),
                 )),
             }
         }
     };
 }
 
+pub struct CallFrame {
+    function: ObjectPtr,
+    instruction_index: usize,
+    slots_index: usize,
+}
+
+impl CallFrame {
+    fn slot(&self, offset: usize) -> usize {
+        self.slots_index + offset
+    }
+}
+
 pub struct VM<Allocator: ObjectAllocator> {
     pub allocator: Allocator,
-    chunk: Chunk,
-    index: usize,
     stack: Vec<ObjectPtr>,
     singletons: Vec<ObjectPtr>,
     globals: HashMap<String, ObjectPtr>,
+    frames: Vec<CallFrame>,
 }
 
 impl<Allocator> VM<Allocator>
     where Allocator: ObjectAllocator
 {
-    pub fn new(chunk: Chunk, allocator: Allocator) -> VM<Allocator> {
+    pub fn new(allocator: Allocator) -> VM<Allocator> {
         let mut vm = VM {
             allocator,
-            chunk,
-            index: 0,
             stack: vec![],
             singletons: vec![],
             globals: HashMap::new(),
+            frames: vec![],
         };
 
         for obj in vec![Object::Nil, Object::Bool(true), Object::Bool(false)] {
@@ -53,10 +63,17 @@ impl<Allocator> VM<Allocator>
         vm
     }
 
-    pub fn interpret(&mut self, chunk: Chunk) -> Result<()> {
-        self.chunk = chunk;
-        self.index = 0;
-        self.stack = vec![];
+    pub fn interpret(&mut self, function: Function) -> Result<()> {
+        let function = self.alloc(Object::Function(function));
+        self.push(function.clone());
+
+        // TODO: make create_frame(...) function?
+        let frame = CallFrame {
+            function,
+            instruction_index: 0,
+            slots_index: 0,
+        };
+        self.frames.push(frame);
 
         loop {
             // Return if reached the end of bytecode.
@@ -69,7 +86,7 @@ impl<Allocator> VM<Allocator>
                 Ok(code) => code,
                 Err(_) => return Err(Error::new(
                     format!("Invalid byte {}.", byte),
-                    self.chunk.get_line(self.index),
+                    self.chunk().get_line(self.index()),
                 )),
             };
 
@@ -87,12 +104,12 @@ impl<Allocator> VM<Allocator>
                         Some(n) => self.alloc_push(Object::Number(-n)),
                         _ => return Err(Error::new(
                             "The '-' unary operator can only be used on numbers.".to_string(),
-                            self.chunk.get_line(self.index),
+                            self.chunk().get_line(self.index()),
                         )),
                     }
                 },
                 OpCode::Not => {
-                    let value = self.stack.pop().unwrap();
+                    let value = self.pop();
                     self.push(self.get_bool(is_falsey(&*value)));
                 },
                 OpCode::And => binary_op!(self, &&, Bool, Bool)?,
@@ -108,7 +125,7 @@ impl<Allocator> VM<Allocator>
                         }
                         _ => return Err(Error::new(
                             "The '+' operator can only be used by two Strings or two Numbers.".to_string(),
-                            self.chunk.get_line(self.index),
+                            self.chunk().get_line(self.index()),
                         )),
                     }
                 },
@@ -143,7 +160,7 @@ impl<Allocator> VM<Allocator>
                         Some(value) => value.clone(),
                         None => return Err(Error::new(
                             format!("Undefined variable {}.", name),
-                            self.chunk.get_line(self.index - 1),
+                            self.chunk().get_line(self.index() - 1),
                         )),
                     };
 
@@ -158,32 +175,32 @@ impl<Allocator> VM<Allocator>
                     } else {
                         return Err(Error::new(
                             format!("Undefined variable {}.", name),
-                            self.chunk.get_line(self.index - 1),
+                            self.chunk().get_line(self.index() - 1),
                         ));
                     }
                 },
                 OpCode::GetLocal => {
                     let slot = self.read_byte().expect("Expect local slot.") as usize;
-                    self.push(self.stack[slot].clone());
+                    self.push(self.get(self.frame().slot(slot)).clone());
                 },
                 OpCode::SetLocal => {
                     let slot = self.read_byte().expect("Expect local slot.") as usize;
                     // Peek is used here since assignments are also expressions
-                    self.stack[slot] = self.peek(0).clone();
+                    self.set(self.frame().slot(slot), self.peek(0).clone());
                 },
                 OpCode::Jump => {
                     let offset = self.read_short() as usize;
-                    self.index += offset;
+                    self.frame_mut().instruction_index += offset;
                 },
                 OpCode::JumpIfFalse => {
                     let offset = self.read_short() as usize;
                     if is_falsey(self.peek(0)) {
-                        self.index += offset;
+                        self.frame_mut().instruction_index += offset;
                     }
                 },
                 OpCode::Loop => {
                     let offset = self.read_short() as usize;
-                    self.index -= offset;
+                    self.frame_mut().instruction_index -= offset;
                 }
             }
         }
@@ -202,15 +219,27 @@ impl<Allocator> VM<Allocator>
             _ => false,
         }
     }
-
-    fn peek(&self, n: usize) -> &ObjectPtr {
-        &self.stack[self.stack.len() - 1 - n]
-    }
 }
 
 impl<Allocator> VM<Allocator>
     where Allocator: ObjectAllocator
 {
+    fn frame(&self) -> &CallFrame {
+        self.frames.last().unwrap()
+    }
+
+    fn frame_mut(&mut self) -> &mut CallFrame {
+        self.frames.last_mut().unwrap()
+    }
+
+    fn chunk(&self) -> &Chunk {
+        &self.frame().function.unwrap_function().chunk
+    }
+
+    fn index(&self) -> usize {
+        self.frame().instruction_index
+    }
+
     fn pop(&mut self) -> ObjectPtr {
         self.stack.pop().unwrap()
     }
@@ -219,10 +248,22 @@ impl<Allocator> VM<Allocator>
         self.stack.push(value);
     }
 
+    fn get(&self, index: usize) -> &ObjectPtr {
+        &self.stack[index]
+    }
+
+    fn set(&mut self, index: usize, item: ObjectPtr) {
+        self.stack[index] = item;
+    }
+
+    fn peek(&self, n: usize) -> &ObjectPtr {
+        &self.stack[self.stack.len() - 1 - n]
+    }
+
     fn read_byte(&mut self) -> Option<u8> {
-        if self.index < self.chunk.code.len() {
-            let value = self.chunk.code[self.index];
-            self.index += 1;
+        if self.index() < self.chunk().code.len() {
+            let value = self.chunk().code[self.index()];
+            self.frame_mut().instruction_index += 1;
             Some(value)
         } else {
             None
@@ -230,14 +271,14 @@ impl<Allocator> VM<Allocator>
     }
 
     fn read_short(&mut self) -> u16 {
-        let value = ((self.chunk.code[self.index] as u16) << 8) | self.chunk.code[self.index + 1] as u16;
-        self.index += 2;
+        let value = ((self.chunk().code[self.index()] as u16) << 8) | self.chunk().code[self.index() + 1] as u16;
+        self.frame_mut().instruction_index += 2;
         value
     }
 
     fn read_constant(&mut self) -> ObjectPtr {
         let byte = self.read_byte().expect("Constant not encoded.");
-        self.chunk.constants[byte as usize].clone()
+        self.chunk().constants[byte as usize].clone()
     }
 
     fn print_value(&self, object: &Object) {
