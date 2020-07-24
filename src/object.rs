@@ -1,10 +1,11 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
+use crate::chunk::Chunk;
+
 macro_rules! generate_object_enum {
     ( $( $name:ident $(($ty:ty))?, )* ) => {
 
-        #[derive(Clone)]
         pub enum Object {
             $(
                 $name $(($ty))?,
@@ -68,6 +69,7 @@ generate_object_enum! {
     Bool(bool),
     Number(f64),
     String(String),
+    Function(Function),
 }
 
 impl fmt::Display for Object {
@@ -77,11 +79,15 @@ impl fmt::Display for Object {
             Object::Bool(value) => write!(f, "{}", value),
             Object::Number(value) => write!(f, "{}", value),
             Object::String(value) => write!(f, "\"{}\"", value),
+            Object::Function(function) => match &function.name {
+                Some(name) => write!(f, "<fn {}>", name),
+                None => write!(f, "<script>"),
+            }
         }
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ObjectPtr {
     ptr: *mut Object,
 }
@@ -122,4 +128,25 @@ impl DerefMut for ObjectPtr {
             &mut *self.ptr
         }
     }
+}
+
+pub struct Function {
+    pub name: Option<String>,
+    pub arity: usize,
+    pub chunk: Chunk,
+}
+
+impl Function {
+    pub fn new(name: Option<String>, arity: usize, chunk: Chunk) -> Function {
+        Function {
+            name,
+            arity,
+            chunk,
+        }
+    }
+}
+
+pub enum FunctionType {
+    Function,
+    Script,
 }
