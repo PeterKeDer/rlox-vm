@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, OpCode};
-use crate::object::{Object, ObjectType, ObjectPtr, Function, NativeFn};
+use crate::object::{Value, ValueType, Object, ObjectType, ObjectPtr, Function, NativeFn};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -12,8 +12,8 @@ macro_rules! binary_op {
             let b = $vm.pop();
             let a = $vm.pop();
 
-            match (&*a, &*b) {
-                (Object::$ident_ty(a), Object::$ident_ty(b)) => Ok($vm.alloc_push(Object::$res_ty(*a $op *b))),
+            match (a, b) {
+                (Value::$ident_ty(a), Value::$ident_ty(b)) => Ok($vm.push(Value::$res_ty(a $op b))),
                 _ => Err(Error::new(
                     format!(
                         "The operator '{}' can only be used on two objects of type {}.",
@@ -42,9 +42,8 @@ impl CallFrame {
 
 pub struct VM<Allocator: ObjectAllocator> {
     pub allocator: Allocator,
-    stack: Vec<ObjectPtr>,
-    singletons: Vec<ObjectPtr>,
-    globals: HashMap<String, ObjectPtr>,
+    stack: Vec<Value>,
+    globals: HashMap<String, Value>,
     frames: Vec<CallFrame>,
 }
 
@@ -56,15 +55,9 @@ where
         let mut vm = VM {
             allocator,
             stack: vec![],
-            singletons: vec![],
             globals: HashMap::new(),
             frames: vec![],
         };
-
-        for obj in vec![Object::Nil, Object::Bool(true), Object::Bool(false)] {
-            let ptr = vm.alloc(obj);
-            vm.singletons.push(ptr);
-        }
 
         vm.define_native("clock".to_string(), Box::new(clock_native));
 
@@ -79,7 +72,7 @@ where
         self.push(function.clone());
 
         // Create and push the call frame
-        self.call(function, 0)?;
+        self.call_value(function, 0)?;
 
         loop {
             let byte = self.read_byte();
@@ -97,12 +90,12 @@ where
                     let value = self.read_constant();
                     self.push(value);
                 },
-                OpCode::True => self.push(self.get_bool(true)),
-                OpCode::False => self.push(self.get_bool(false)),
-                OpCode::Nil => self.push(self.get_nil()),
+                OpCode::True => self.push(Value::Bool(true)),
+                OpCode::False => self.push(Value::Bool(false)),
+                OpCode::Nil => self.push(Value::Nil),
                 OpCode::Negate => {
                     match self.pop().as_number() {
-                        Some(n) => self.alloc_push(Object::Number(-n)),
+                        Some(n) => self.push(Value::Number(-n)),
                         _ => return Err(Error::new(
                             "The '-' unary operator can only be used on numbers.".to_string(),
                             self.chunk().get_line(self.index()),
@@ -111,24 +104,35 @@ where
                 },
                 OpCode::Not => {
                     let value = self.pop();
-                    self.push(self.get_bool(is_falsey(&*value)));
+                    self.push(Value::Bool(is_falsey(&value)));
                 },
                 OpCode::And => binary_op!(self, &&, Bool, Bool)?,
                 OpCode::Or => binary_op!(self, ||, Bool, Bool)?,
                 OpCode::Add => {
                     match (self.peek(1).get_type(), self.peek(0).get_type()) {
-                        (ObjectType::Number, ObjectType::Number) => binary_op!(self, +, Number, Number)?,
-                        (ObjectType::String, ObjectType::String) => {
-                            let b = self.pop();
-                            let a = self.pop();
-                            let string = format!("{}{}", a.unwrap_string(), b.unwrap_string());
-                            self.alloc_push(Object::String(string));
+                        (ValueType::Number, ValueType::Number) => {
+                            binary_op!(self, +, Number, Number)?;
+                            continue;
+                        },
+                        (ValueType::Object, ValueType::Object) => {
+                            match (self.peek(1).unwrap_object().get_type(), self.peek(0).unwrap_object().get_type()) {
+                                (ObjectType::String, ObjectType::String) => {
+                                    let b = self.pop();
+                                    let a = self.pop();
+                                    let string = format!("{}{}", a.unwrap_object().unwrap_string(), b.unwrap_object().unwrap_string());
+                                    self.alloc_push(Object::String(string));
+                                    continue;
+                                },
+                                _ => (),
+                            }
                         }
-                        _ => return Err(Error::new(
-                            "The '+' operator can only be used by two Strings or two Numbers.".to_string(),
-                            self.chunk().get_line(self.index()),
-                        )),
+                        _ => (),
                     }
+
+                    return Err(Error::new(
+                        "The '+' operator can only be used by two Strings or two Numbers.".to_string(),
+                        self.chunk().get_line(self.index()),
+                    ));
                 },
                 OpCode::Subtract => binary_op!(self, -, Number, Number)?,
                 OpCode::Multiply => binary_op!(self, *, Number, Number)?,
@@ -136,26 +140,26 @@ where
                 OpCode::Equal => {
                     let b = self.pop();
                     let a = self.pop();
-                    self.push(self.get_bool(self.values_equal(&*a, &*b)));
+                    self.push(Value::Bool(self.values_equal(&a, &b)));
                 },
                 OpCode::Less => binary_op!(self, <, Number, Bool)?,
                 OpCode::Greater => binary_op!(self, >, Number, Bool)?,
                 OpCode::Print => {
                     let value = self.pop();
-                    self.print_value(&*value);
+                    self.print_value(&value);
                 },
                 OpCode::Pop => {
                     self.pop();
                 },
                 OpCode::DefineGlobal => {
-                    let name = self.read_constant().unwrap_string().clone();
+                    let name = self.read_constant().unwrap_object().unwrap_string().clone();
                     let value = self.pop();
 
                     self.globals.insert(name, value);
                 },
                 OpCode::GetGlobal => {
                     let name_constant = self.read_constant();
-                    let name = name_constant.unwrap_string();
+                    let name = name_constant.unwrap_object().unwrap_string();
 
                     let value = match self.globals.get(name) {
                         Some(value) => value.clone(),
@@ -168,7 +172,7 @@ where
                     self.push(value);
                 },
                 OpCode::SetGlobal => {
-                    let name = self.read_constant().unwrap_string().clone();
+                    let name = self.read_constant().unwrap_object().unwrap_string().clone();
                     let value = self.peek(0).clone();
 
                     if self.globals.contains_key(&name) {
@@ -250,39 +254,47 @@ where
         self.globals.insert(name, ptr);
     }
 
-    fn values_equal(&self, a: &Object, b: &Object) -> bool {
+    fn values_equal(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
-            (Object::Nil, Object::Nil) => true,
-            (Object::Bool(a), Object::Bool(b)) => a == b,
-            (Object::Number(a), Object::Number(b)) => a == b,
-            (Object::String(a), Object::String(b)) => a == b,
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => match (&**a, &**b) {
+                (Object::String(a), Object::String(b)) => a == b,
+                _ => false,
+            },
             _ => false,
         }
     }
 
-    fn call_value(&mut self, ptr: ObjectPtr, arg_count: usize) -> Result<()> {
-        match &*ptr {
-            Object::Function(_) => self.call(ptr, arg_count),
-            Object::Native(native) => {
-                // Pop arguments and add them to vector
-                let mut args = vec![];
-                for _ in 0..arg_count {
-                    args.insert(0, self.pop());
-                }
+    fn call_value(&mut self, value: Value, arg_count: usize) -> Result<()> {
+        match value {
+            Value::Object(ptr) => match &*ptr {
+                Object::Function(_) => return self.call(ptr, arg_count),
+                Object::Native(native) => {
+                    // Pop arguments and add them to vector
+                    let mut args = vec![];
+                    for _ in 0..arg_count {
+                        args.insert(0, self.pop());
+                    }
 
-                // Pop native function
-                self.pop();
+                    // Pop native function
+                    self.pop();
 
-                let result = native(&mut self.allocator, arg_count, args)?;
-                self.push(result);
+                    let result = native(&mut self.allocator, arg_count, args)?;
+                    self.push(result);
 
-                Ok(())
+                    return Ok(());
+                },
+                _ => (),
             },
-            _ => Err(Error::new(
-                "Can only call functions and classes.".to_string(),
-                self.chunk().get_line(self.index()),
-            )),
+            _ => (),
         }
+
+        Err(Error::new(
+            "Can only call functions and classes.".to_string(),
+            self.chunk().get_line(self.index()),
+        ))
     }
 
     /// Call a function.
@@ -319,43 +331,53 @@ impl<Allocator> VM<Allocator>
 where
     Allocator: ObjectAllocator,
 {
+    #[inline(never)]
     fn frame(&self) -> &CallFrame {
         &self.frames[self.frames.len() - 1]
     }
 
+    #[inline(never)]
     fn frame_mut(&mut self) -> &mut CallFrame {
         let index = self.frames.len() - 1;
         &mut self.frames[index]
     }
 
+    #[inline(never)]
     fn chunk(&self) -> &Chunk {
         &self.frame().function.unwrap_function().chunk
     }
 
+    #[inline(never)]
     fn index(&self) -> usize {
         self.frame().instruction_index
     }
 
-    fn pop(&mut self) -> ObjectPtr {
+    #[inline(never)]
+    fn pop(&mut self) -> Value {
         self.stack.pop().unwrap()
     }
 
-    fn push(&mut self, value: ObjectPtr) {
+    #[inline(never)]
+    fn push(&mut self, value: Value) {
         self.stack.push(value);
     }
 
-    fn get(&self, index: usize) -> &ObjectPtr {
+    #[inline(never)]
+    fn get(&self, index: usize) -> &Value {
         &self.stack[index]
     }
 
-    fn set(&mut self, index: usize, item: ObjectPtr) {
+    #[inline(never)]
+    fn set(&mut self, index: usize, item: Value) {
         self.stack[index] = item;
     }
 
-    fn peek(&self, n: usize) -> &ObjectPtr {
+    #[inline(never)]
+    fn peek(&self, n: usize) -> &Value {
         &self.stack[self.stack.len() - 1 - n]
     }
 
+    #[inline(never)]
     fn read_byte(&mut self) -> u8 {
         let value = self.chunk().code[self.index()];
         self.frame_mut().instruction_index += 1;
@@ -368,29 +390,18 @@ where
         value
     }
 
-    fn read_constant(&mut self) -> ObjectPtr {
+    fn read_constant(&mut self) -> Value {
         let byte = self.read_byte();
         self.chunk().constants[byte as usize].clone()
     }
 
-    fn print_value(&self, object: &Object) {
-        println!("{}", object);
+    fn print_value(&self, value: &Value) {
+        println!("{}", value);
     }
 
-    fn get_nil(&self) -> ObjectPtr {
-        self.singletons[0].clone()
-    }
-
-    fn get_bool(&self, value: bool) -> ObjectPtr {
-        if value {
-            self.singletons[1].clone()
-        } else {
-            self.singletons[2].clone()
-        }
-    }
-
-    fn alloc(&mut self, object: Object) -> ObjectPtr {
-        self.allocator.allocate(object)
+    #[inline(never)]
+    fn alloc(&mut self, object: Object) -> Value {
+        Value::Object(self.allocator.allocate(object))
     }
 
     fn alloc_push(&mut self, object: Object) {
@@ -399,14 +410,14 @@ where
     }
 }
 
-fn is_falsey(value: &Object) -> bool {
+fn is_falsey(value: &Value) -> bool {
     match value {
-        Object::Bool(false) | Object::Nil => true,
+        Value::Bool(false) | Value::Nil => true,
         _ => false,
     }
 }
 
-fn clock_native(allocator: &mut dyn ObjectAllocator, _arg_count: usize, _args: Vec<ObjectPtr>) -> Result<ObjectPtr> {
+fn clock_native(_allocator: &mut dyn ObjectAllocator, _arg_count: usize, _args: Vec<Value>) -> Result<Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let ms = SystemTime::now()
@@ -414,5 +425,5 @@ fn clock_native(allocator: &mut dyn ObjectAllocator, _arg_count: usize, _args: V
         .unwrap()
         .as_millis();
 
-    Ok(allocator.allocate(Object::Number(ms as f64)))
+    Ok(Value::Number(ms as f64))
 }

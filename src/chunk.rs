@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 
 use num_enum::TryFromPrimitive;
 
-use crate::object::ObjectPtr;
+use crate::object::Value;
 
 #[derive(Debug, TryFromPrimitive, Copy, Clone)]
 #[repr(u8)]
@@ -36,10 +36,10 @@ pub enum OpCode {
     Return,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Chunk {
     pub code: Vec<u8>,
-    pub constants: Vec<ObjectPtr>,
+    pub constants: Vec<Value>,
     // Using run-length encoding
     // The first element of tuple represents the line number, and the second, number of repeats
     lines: Vec<(usize, usize)>,
@@ -66,9 +66,9 @@ impl Chunk {
         }
     }
 
-    pub fn add_constant(&mut self, ptr: ObjectPtr) -> usize {
+    pub fn add_constant(&mut self, value: Value) -> usize {
         let index = self.constants.len();
-        self.constants.push(ptr);
+        self.constants.push(value);
         index
     }
 
@@ -168,7 +168,7 @@ impl Chunk {
 
     fn constant_instruction(&self, name: &str, offset: &mut usize) {
         let constant = self.code[*offset + 1];
-        println!("{:<16} {:4} '{:?}'", name, constant, self.constants[constant as usize]);
+        println!("{:<16} {:4} '{}'", name, constant, self.constants[constant as usize]);
         *offset += 2
     }
 

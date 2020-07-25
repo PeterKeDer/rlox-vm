@@ -5,7 +5,7 @@ use num_enum::TryFromPrimitive;
 
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::chunk::{Chunk, OpCode};
-use crate::object::{ObjectPtr, Object, Function, FunctionType};
+use crate::object::{Value, Object, Function, FunctionType};
 use crate::error::{Error, Result};
 use crate::allocator::ObjectAllocator;
 use crate::compiler::{Compiler, Local};
@@ -246,9 +246,9 @@ impl Parser<'_, '_> {
 
         let enclosing = *mem::replace(&mut self.compiler.enclosing, None).unwrap();
         let prev = mem::replace(&mut self.compiler, enclosing);
-        let function_obj = Object::Function(prev.function);
+        let function = self.alloc(Object::Function(prev.function));
 
-        self.emit_constant(function_obj).or(result)
+        self.emit_constant(function).or(result)
     }
 
     fn function_util(&mut self) -> Result<()> {
@@ -579,7 +579,7 @@ impl Parser<'_, '_> {
     fn string(&mut self) -> Result<()> {
         let token = self.previous();
         let string = token.lexeme[1..token.lexeme.len() - 1].to_string();
-        let value = Object::String(string);
+        let value = self.alloc(Object::String(string));
         self.emit_constant(value)?;
         Ok(())
     }
@@ -589,7 +589,7 @@ impl Parser<'_, '_> {
 
         let value = token.lexeme
             .parse()
-            .map(Object::Number)
+            .map(Value::Number)
             .map_err(|_| Error::new("Cannot parse float.".to_string(), token.line))?;
 
         self.emit_constant(value)?;
@@ -842,8 +842,8 @@ impl<'src> Parser<'src, '_> {
         local.depth = Some(self.compiler.scope_depth);
     }
 
-    fn make_constant(&mut self, ptr: ObjectPtr) -> Result<u8> {
-        let constant = self.current_chunk().add_constant(ptr);
+    fn make_constant(&mut self, value: Value) -> Result<u8> {
+        let constant = self.current_chunk().add_constant(value);
 
         if constant > u8::MAX as usize {
             Err(Error::new(
@@ -869,9 +869,8 @@ impl<'src> Parser<'src, '_> {
         self.emit_bytes(OpCode::Nil as u8, OpCode::Return as u8);
     }
 
-    fn emit_constant(&mut self, object: Object) -> Result<()> {
-        let ptr = self.alloc(object);
-        let constant = self.make_constant(ptr)?;
+    fn emit_constant(&mut self, value: Value) -> Result<()> {
+        let constant = self.make_constant(value)?;
         self.emit_bytes(OpCode::Constant as u8, constant);
         Ok(())
     }
@@ -916,7 +915,7 @@ impl<'src> Parser<'src, '_> {
         Ok(())
     }
 
-    fn alloc(&mut self, object: Object) -> ObjectPtr {
-        self.allocator.allocate(object)
+    fn alloc(&mut self, object: Object) -> Value {
+        Value::Object(self.allocator.allocate(object))
     }
 }
