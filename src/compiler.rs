@@ -24,6 +24,7 @@ impl<'s> Local<'s> {
 }
 
 pub struct Compiler<'src> {
+    pub enclosing: Option<Box<Compiler<'src>>>,
     pub locals: Vec<Local<'src>>,
     pub scope_depth: usize,
     pub function: Function,
@@ -31,14 +32,19 @@ pub struct Compiler<'src> {
 }
 
 impl<'src> Compiler<'src> {
-    pub fn new(function_type: FunctionType) -> Compiler<'src> {
+    pub fn new(
+        enclosing: Option<Box<Compiler<'src>>>,
+        function_type: FunctionType,
+        function_name: Option<String>,
+    ) -> Compiler<'src> {
         // The placeholder is reserved for the VM to put the function being executed
         let locals = vec![Local::placeholder()];
 
         Compiler {
+            enclosing,
             locals,
             scope_depth: 0,
-            function: Function::new(None, 0, Chunk::new()),
+            function: Function::new(function_name, 0, Chunk::new()),
             function_type,
         }
     }

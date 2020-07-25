@@ -73,7 +73,7 @@ macro_rules! parse_rules {
 // `prefix` and `infix` correspond to member functions belonging to `Parser`.
 parse_rules! {
 //  Token Type          Prefix      Infix       Precedence
-    LeftParen       => (grouping,   none,       None        ),
+    LeftParen       => (grouping,   call,       Call        ),
     RightParen      => (none,       none,       None        ),
     LeftBrace       => (none,       none,       None        ),
     RightBrace      => (none,       none,       None        ),
@@ -148,7 +148,7 @@ impl Parser<'_, '_> {
             allocator,
             scanner,
             current: None,
-            compiler: Compiler::new(FunctionType::Script),
+            compiler: Compiler::new(None, FunctionType::Script, None),
             previous: None,
             precedence: Precedence::None,
             has_error: false,
@@ -160,11 +160,13 @@ impl Parser<'_, '_> {
         // Parses and compiles a program
         parser.program()?;
 
-        if parser.has_error {
-            return Err(Error::new("At least one error has occured.".to_string(), 1));
-        }
+        parser.emit_return();
 
-        Ok(parser.compiler.function)
+        if parser.has_error {
+            Err(Error::new("At least one error has occured.".to_string(), 1))
+        } else {
+            Ok(parser.compiler.function)
+        }
     }
 
     fn program(&mut self) -> Result<()> {
@@ -176,7 +178,13 @@ impl Parser<'_, '_> {
     }
 
     fn declaration(&mut self) -> Result<()> {
-        match self.statement() {
+        let result = match_advance!(self, {
+            Var => self.variable_declaration(),
+            Fun => self.function_declaration(),
+            _ => self.statement(),
+        });
+
+        match result {
             Ok(_) => Ok(()),
             Err(err) => {
                 // TODO: better error handling
@@ -190,12 +198,12 @@ impl Parser<'_, '_> {
 
     fn statement(&mut self) -> Result<()> {
         match_advance!(self, {
-            Var => self.variable_declaration(),
+            LeftBrace => self.block(),
             Print => self.print_statement(),
             If => self.if_statement(),
             While => self.while_statement(),
             For => self.for_statement(),
-            LeftBrace => self.block(),
+            Return => self.return_statement(),
             _ => self.expression_statement(),
         })
     }
@@ -209,6 +217,66 @@ impl Parser<'_, '_> {
 
         self.consume(TokenType::RightBrace, "Expect '}' after block.".to_string())?;
         self.end_scope();
+
+        Ok(())
+    }
+
+    fn function_declaration(&mut self) -> Result<()> {
+        let global = self.parse_variable("Expect function name.".to_string())?;
+        self.mark_initialized();
+        self.function(FunctionType::Function)?;
+        self.define_variable(global);
+        Ok(())
+    }
+
+    fn function(&mut self, function_type: FunctionType) -> Result<()> {
+        // Create a new compiler to parse the function
+        let function_name = self.previous().lexeme.to_string();
+        let compiler = Compiler::new(None, function_type, Some(function_name));
+
+        // Swap in the current compiler as its enclosing
+        let enclosing = mem::replace(&mut self.compiler, compiler);
+        self.compiler.enclosing = Some(Box::new(enclosing));
+
+        // Note: end scope is not needed after since compiler is being dropped
+        self.begin_scope();
+
+        let result = self.function_util();
+        self.emit_return();
+
+        let enclosing = *mem::replace(&mut self.compiler.enclosing, None).unwrap();
+        let prev = mem::replace(&mut self.compiler, enclosing);
+        let function_obj = Object::Function(prev.function);
+
+        self.emit_constant(function_obj).or(result)
+    }
+
+    fn function_util(&mut self) -> Result<()> {
+        self.consume(TokenType::LeftParen, "Expect '(' after function name.".to_string())?;
+
+        while !self.check(TokenType::RightParen) {
+            if self.compiler.function.arity == u8::MAX {
+                return Err(Error::new(
+                    format!("Cannot have more than {} parameters.", u8::MAX),
+                    self.current().line,
+                ));
+            }
+
+            self.compiler.function.arity += 1;
+
+            // Parse the parameter and declare it as a local variable in the scope
+            let param = self.parse_variable("Expect parameter name.".to_string())?;
+            self.define_variable(param);
+
+            if !self.match_token(TokenType::Comma)? {
+                break;
+            }
+        }
+
+        self.consume(TokenType::RightParen, "Expect ')' after parameters.".to_string())?;
+
+        self.consume(TokenType::LeftBrace, "Expect '{' before function body.".to_string())?;
+        self.block()?;
 
         Ok(())
     }
@@ -354,6 +422,24 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
+    fn return_statement(&mut self) -> Result<()> {
+        if self.compiler.function_type == FunctionType::Script {
+            return Err(Error::new(
+                "Cannot return from top-level code.".to_string(),
+                self.previous().line,
+            ));
+        }
+
+        if self.match_token(TokenType::Semicolon)? {
+            self.emit_return();
+        } else {
+            self.expression()?;
+            self.consume(TokenType::Semicolon, "Expect ';' after return value.".to_string())?;
+            self.emit_byte(OpCode::Return as u8);
+        }
+        Ok(())
+    }
+
     fn expression_statement(&mut self) -> Result<()> {
         self.expression()?;
         self.consume(TokenType::Semicolon, "Expect ';' after expression.".to_string())?;
@@ -403,23 +489,33 @@ impl Parser<'_, '_> {
         Err(Error::new(format!("Expected expression, got {:?}.", token.token_type), token.line))
     }
 
-    fn grouping(&mut self) -> Result<()> {
-        // Assume that '(' is already consumed
-        self.expression()?;
-        self.consume(TokenType::RightParen, "Expected closing ')'.".to_string())?;
+    fn or(&mut self) -> Result<()> {
+        // The `or` operator evaluates to the left side if it is truthy, otherwise the right side
+        // If value is falsey, expression
+        let else_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+
+        // Jump to end since value is truthy
+        let end_jump = self.emit_jump(OpCode::Jump as u8);
+
+        self.patch_jump(else_jump)?;
+        self.emit_byte(OpCode::Pop as u8);
+
+        self.parse_precedence(Precedence::Or)?;
+        self.patch_jump(end_jump)?;
+
         Ok(())
     }
 
-    fn unary(&mut self) -> Result<()> {
-        let operator = self.previous().token_type;
+    fn and(&mut self) -> Result<()> {
+        // The `and` operator evaluates to the left side if it is falsey, otherwise the right side
+        // Jump to end if the value is falsey
+        let end_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
 
-        self.parse_precedence(Precedence::Unary)?;
+        // If did not jump to end, the bool value is no longer needed
+        self.emit_byte(OpCode::Pop as u8);
 
-        match operator {
-            TokenType::Minus => self.emit_byte(OpCode::Negate as u8),
-            TokenType::Bang => self.emit_byte(OpCode::Not as u8),
-            _ => panic!("Unexpected unary operator {:?}.", operator),
-        }
+        self.parse_precedence(Precedence::And)?;
+        self.patch_jump(end_jump)?;
 
         Ok(())
     }
@@ -449,34 +545,30 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    fn and(&mut self) -> Result<()> {
-        // The `and` operator evaluates to the left side if it is falsey, otherwise the right side
-        // Jump to end if the value is falsey
-        let end_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+    fn unary(&mut self) -> Result<()> {
+        let operator = self.previous().token_type;
 
-        // If did not jump to end, the bool value is no longer needed
-        self.emit_byte(OpCode::Pop as u8);
+        self.parse_precedence(Precedence::Unary)?;
 
-        self.parse_precedence(Precedence::And)?;
-        self.patch_jump(end_jump)?;
+        match operator {
+            TokenType::Minus => self.emit_byte(OpCode::Negate as u8),
+            TokenType::Bang => self.emit_byte(OpCode::Not as u8),
+            _ => panic!("Unexpected unary operator {:?}.", operator),
+        }
 
         Ok(())
     }
 
-    fn or(&mut self) -> Result<()> {
-        // The `or` operator evaluates to the left side if it is truthy, otherwise the right side
-        // If value is falsey, expression
-        let else_jump = self.emit_jump(OpCode::JumpIfFalse as u8);
+    fn call(&mut self) -> Result<()> {
+        let arg_count = self.argument_list()?;
+        self.emit_bytes(OpCode::Call as u8, arg_count);
+        Ok(())
+    }
 
-        // Jump to end since value is truthy
-        let end_jump = self.emit_jump(OpCode::Jump as u8);
-
-        self.patch_jump(else_jump)?;
-        self.emit_byte(OpCode::Pop as u8);
-
-        self.parse_precedence(Precedence::Or)?;
-        self.patch_jump(end_jump)?;
-
+    fn grouping(&mut self) -> Result<()> {
+        // Assume that '(' is already consumed
+        self.expression()?;
+        self.consume(TokenType::RightParen, "Expected closing ')'.".to_string())?;
         Ok(())
     }
 
@@ -516,10 +608,36 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    /// Emit code to get or set a global variable with name.
+    fn argument_list(&mut self) -> Result<u8> {
+        let mut count = 0;
+
+        while !self.check(TokenType::RightParen) {
+            if count == u8::MAX {
+                return Err(Error::new(
+                    format!("Cannot have more than {} arguments.", u8::MAX),
+                    self.current().line,
+                ));
+            }
+
+            self.expression()?;
+            count += 1;
+
+            if !self.match_token(TokenType::Comma)? {
+                break;
+            }
+        }
+
+        self.consume(TokenType::RightParen, "Expect ')' after arguments.".to_string())?;
+
+        Ok(count)
+    }
+
+    /// Emit bytecode to get or set a variable with name.
     fn named_variable(&mut self, name: Token<'_>) -> Result<()> {
         let (get_op, set_op, arg) = match self.resolve_local(name)? {
+            // Get/set local variable by index on the stack
             Some(index) => (OpCode::GetLocal, OpCode::SetLocal, index as u8),
+            // Get/set global variable with a pointer to its name
             None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.to_string())?),
         };
 
@@ -533,7 +651,7 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    /// Parse a variable and return the constant address to its name (String).
+    /// Parse a variable. If it is global, return the constant address to its name (String), otherwise 0.
     fn parse_variable(&mut self, message: String) -> Result<u8> {
         self.consume(TokenType::Identifier, message)?;
 
@@ -637,12 +755,15 @@ impl<'src> Parser<'src, '_> {
         self.compiler.chunk()
     }
 
-    /// Create an constant that points to an identifier string
+    /// Create an constant that points to an identifier string, used for global variables.
     fn identifier_constant(&mut self, name: String) -> Result<u8> {
         let ptr = self.alloc(Object::String(name));
         self.make_constant(ptr)
     }
 
+    /// Declare a variable with `self.previous` as its name.
+    /// If in global scope, nothing needs to be done.
+    /// Otherwise create add a new `Local` if it does not already exist in the current scope.
     fn declare_variable(&mut self) -> Result<()> {
         if self.compiler.scope_depth == 0 {
             // Global variables are implicitly declared
@@ -701,13 +822,24 @@ impl<'src> Parser<'src, '_> {
         Ok(None)
     }
 
+    /// Emit the bytecode that defines a variable.
     fn define_variable(&mut self, global: u8) {
         if self.compiler.scope_depth > 0 {
             // Local variable, mark as initialized
-            self.compiler.locals.last_mut().expect("Expect declared local variable.").depth = Some(self.compiler.scope_depth);
+            self.mark_initialized()
         } else {
+            // Define global variable in bytecode
             self.emit_bytes(OpCode::DefineGlobal as u8, global);
         }
+    }
+
+    fn mark_initialized(&mut self) {
+        if self.compiler.scope_depth == 0 {
+            return;
+        }
+
+        let local = self.compiler.locals.last_mut().expect("Expect declared local variable.");
+        local.depth = Some(self.compiler.scope_depth);
     }
 
     fn make_constant(&mut self, ptr: ObjectPtr) -> Result<u8> {
@@ -731,6 +863,10 @@ impl<'src> Parser<'src, '_> {
     fn emit_bytes(&mut self, a: u8, b: u8) {
         self.emit_byte(a);
         self.emit_byte(b);
+    }
+
+    fn emit_return(&mut self) {
+        self.emit_bytes(OpCode::Nil as u8, OpCode::Return as u8);
     }
 
     fn emit_constant(&mut self, object: Object) -> Result<()> {

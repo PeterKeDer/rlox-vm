@@ -60,9 +60,13 @@ impl App {
             Ok(function) => {
                 function.chunk.disassemble("Test");
                 let result = self.vm.interpret(function);
-                println!("Interpret result: {:?}", result);
+
+                if let Err(error) = result {
+                    println!("{}", error);
+                    self.vm.print_stack_trace();
+                }
             },
-            Err(error) => println!("Error [{}]: {}", error.line, error.message),
+            Err(error) => println!("{}", error),
         }
     }
 }

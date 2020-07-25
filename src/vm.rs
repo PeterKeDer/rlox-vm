@@ -15,13 +15,18 @@ macro_rules! binary_op {
             match (&*a, &*b) {
                 (Object::$ident_ty(a), Object::$ident_ty(b)) => Ok($vm.alloc_push(Object::$res_ty(*a $op *b))),
                 _ => Err(Error::new(
-                    format!("The operator '{}' can only be used on two numbers.", stringify!($op)),
+                    format!(
+                        "The operator '{}' can only be used on two objects of type {}.",
+                        stringify!($op), stringify!($ident_ty),
+                    ),
                     $vm.chunk().get_line($vm.index()),
                 )),
             }
         }
     };
 }
+
+static MAX_FRAMES: usize = 255;
 
 pub struct CallFrame {
     function: ObjectPtr,
@@ -44,7 +49,8 @@ pub struct VM<Allocator: ObjectAllocator> {
 }
 
 impl<Allocator> VM<Allocator>
-    where Allocator: ObjectAllocator
+where
+    Allocator: ObjectAllocator,
 {
     pub fn new(allocator: Allocator) -> VM<Allocator> {
         let mut vm = VM {
@@ -64,23 +70,17 @@ impl<Allocator> VM<Allocator>
     }
 
     pub fn interpret(&mut self, function: Function) -> Result<()> {
+        self.frames.clear();
+        self.stack.clear();
+
         let function = self.alloc(Object::Function(function));
         self.push(function.clone());
 
-        // TODO: make create_frame(...) function?
-        let frame = CallFrame {
-            function,
-            instruction_index: 0,
-            slots_index: 0,
-        };
-        self.frames.push(frame);
+        // Create and push the call frame
+        self.call(function, 0)?;
 
         loop {
-            // Return if reached the end of bytecode.
-            let byte = match self.read_byte() {
-                Some(byte) => byte,
-                None => return Ok(()),
-            };
+            let byte = self.read_byte();
 
             let code = match OpCode::try_from(byte) {
                 Ok(code) => code,
@@ -91,7 +91,6 @@ impl<Allocator> VM<Allocator>
             };
 
             match code {
-                OpCode::Return => return Ok(()),
                 OpCode::Constant => {
                     let value = self.read_constant();
                     self.push(value);
@@ -180,11 +179,11 @@ impl<Allocator> VM<Allocator>
                     }
                 },
                 OpCode::GetLocal => {
-                    let slot = self.read_byte().expect("Expect local slot.") as usize;
+                    let slot = self.read_byte() as usize;
                     self.push(self.get(self.frame().slot(slot)).clone());
                 },
                 OpCode::SetLocal => {
-                    let slot = self.read_byte().expect("Expect local slot.") as usize;
+                    let slot = self.read_byte() as usize;
                     // Peek is used here since assignments are also expressions
                     self.set(self.frame().slot(slot), self.peek(0).clone());
                 },
@@ -201,8 +200,42 @@ impl<Allocator> VM<Allocator>
                 OpCode::Loop => {
                     let offset = self.read_short() as usize;
                     self.frame_mut().instruction_index -= offset;
-                }
+                },
+                OpCode::Call => {
+                    let arg_count = self.read_byte();
+                    self.call_value(self.peek(arg_count as usize).clone(), arg_count)?;
+                },
+                OpCode::Return => {
+                    let result = self.pop();
+
+                    let frame = self.frames.pop().unwrap();
+
+                    // Pop arguments passed to the function and the function itself
+                    while self.stack.len() > frame.slots_index {
+                        self.pop();
+                    }
+
+                    if self.frames.is_empty() {
+                        return Ok(());
+                    }
+
+                    self.push(result);
+                },
             }
+        }
+    }
+
+    pub fn print_stack_trace(&self) {
+        for frame in self.frames.iter().rev() {
+            let function = frame.function.unwrap_function();
+            println!(
+                "[line {}] in {}",
+                function.chunk.get_line(frame.instruction_index),
+                match &function.name {
+                    Some(name) => name,
+                    None => "script",
+                },
+            );
         }
     }
 
@@ -219,17 +252,58 @@ impl<Allocator> VM<Allocator>
             _ => false,
         }
     }
+
+    fn call_value(&mut self, ptr: ObjectPtr, arg_count: u8) -> Result<()> {
+        match &*ptr {
+            Object::Function(_) => self.call(ptr, arg_count),
+            _ => Err(Error::new(
+                "Can only call functions and classes.".to_string(),
+                self.chunk().get_line(self.index()),
+            )),
+        }
+    }
+
+    /// Call a function.
+    /// Precondition: the `ObjectType` of `function` is `ObjectType::Function`
+    fn call(&mut self, function: ObjectPtr, arg_count: u8) -> Result<()> {
+        let arity = function.unwrap_function().arity;
+        if arity != arg_count {
+            return Err(Error::new(
+                format!("Function {} expects {} arguments but got {}.", *function, arity, arg_count),
+                self.chunk().get_line(self.index()),
+            ));
+        }
+
+        if self.frames.len() == MAX_FRAMES {
+            return Err(Error::new(
+                format!("Stack overflow."),
+                self.chunk().get_line(self.index()),
+            ));
+        }
+
+        // Push new frame
+        let frame = CallFrame {
+            function,
+            instruction_index: 0,
+            slots_index: self.stack.len() - (arg_count as usize) - 1,
+        };
+        self.frames.push(frame);
+
+        Ok(())
+    }
 }
 
 impl<Allocator> VM<Allocator>
-    where Allocator: ObjectAllocator
+where
+    Allocator: ObjectAllocator,
 {
     fn frame(&self) -> &CallFrame {
-        self.frames.last().unwrap()
+        &self.frames[self.frames.len() - 1]
     }
 
     fn frame_mut(&mut self) -> &mut CallFrame {
-        self.frames.last_mut().unwrap()
+        let index = self.frames.len() - 1;
+        &mut self.frames[index]
     }
 
     fn chunk(&self) -> &Chunk {
@@ -260,14 +334,10 @@ impl<Allocator> VM<Allocator>
         &self.stack[self.stack.len() - 1 - n]
     }
 
-    fn read_byte(&mut self) -> Option<u8> {
-        if self.index() < self.chunk().code.len() {
-            let value = self.chunk().code[self.index()];
-            self.frame_mut().instruction_index += 1;
-            Some(value)
-        } else {
-            None
-        }
+    fn read_byte(&mut self) -> u8 {
+        let value = self.chunk().code[self.index()];
+        self.frame_mut().instruction_index += 1;
+        value
     }
 
     fn read_short(&mut self) -> u16 {
@@ -277,7 +347,7 @@ impl<Allocator> VM<Allocator>
     }
 
     fn read_constant(&mut self) -> ObjectPtr {
-        let byte = self.read_byte().expect("Constant not encoded.");
+        let byte = self.read_byte();
         self.chunk().constants[byte as usize].clone()
     }
 

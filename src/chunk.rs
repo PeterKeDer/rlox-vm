@@ -7,7 +7,6 @@ use crate::object::ObjectPtr;
 #[derive(Debug, TryFromPrimitive, Copy, Clone)]
 #[repr(u8)]
 pub enum OpCode {
-    Return,
     Constant,
     True,
     False,
@@ -33,6 +32,8 @@ pub enum OpCode {
     Jump,
     JumpIfFalse,
     Loop,
+    Call,
+    Return,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +126,6 @@ impl Chunk {
 
         match OpCode::try_from(instruction) {
             Ok(op) => match op {
-                OpCode::Return => self.simple_instruction("RETURN", offset),
                 OpCode::Constant => self.constant_instruction("CONSTANT", offset),
                 OpCode::True => self.simple_instruction("TRUE", offset),
                 OpCode::False => self.simple_instruction("FALSE", offset),
@@ -151,6 +151,8 @@ impl Chunk {
                 OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
                 OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
                 OpCode::Loop => self.jump_instruction("LOOP", -1, offset),
+                OpCode::Call => self.byte_instruction("CALL", offset),
+                OpCode::Return => self.simple_instruction("RETURN", offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);

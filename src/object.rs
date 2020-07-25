@@ -132,12 +132,12 @@ impl DerefMut for ObjectPtr {
 
 pub struct Function {
     pub name: Option<String>,
-    pub arity: usize,
+    pub arity: u8,
     pub chunk: Chunk,
 }
 
 impl Function {
-    pub fn new(name: Option<String>, arity: usize, chunk: Chunk) -> Function {
+    pub fn new(name: Option<String>, arity: u8, chunk: Chunk) -> Function {
         Function {
             name,
             arity,
@@ -146,6 +146,7 @@ impl Function {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum FunctionType {
     Function,
     Script,
