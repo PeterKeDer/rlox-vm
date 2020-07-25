@@ -331,53 +331,43 @@ impl<Allocator> VM<Allocator>
 where
     Allocator: ObjectAllocator,
 {
-    #[inline(never)]
     fn frame(&self) -> &CallFrame {
         &self.frames[self.frames.len() - 1]
     }
 
-    #[inline(never)]
     fn frame_mut(&mut self) -> &mut CallFrame {
         let index = self.frames.len() - 1;
         &mut self.frames[index]
     }
 
-    #[inline(never)]
     fn chunk(&self) -> &Chunk {
         &self.frame().function.unwrap_function().chunk
     }
 
-    #[inline(never)]
     fn index(&self) -> usize {
         self.frame().instruction_index
     }
 
-    #[inline(never)]
     fn pop(&mut self) -> Value {
         self.stack.pop().unwrap()
     }
 
-    #[inline(never)]
     fn push(&mut self, value: Value) {
         self.stack.push(value);
     }
 
-    #[inline(never)]
     fn get(&self, index: usize) -> &Value {
         &self.stack[index]
     }
 
-    #[inline(never)]
     fn set(&mut self, index: usize, item: Value) {
         self.stack[index] = item;
     }
 
-    #[inline(never)]
     fn peek(&self, n: usize) -> &Value {
         &self.stack[self.stack.len() - 1 - n]
     }
 
-    #[inline(never)]
     fn read_byte(&mut self) -> u8 {
         let value = self.chunk().code[self.index()];
         self.frame_mut().instruction_index += 1;
@@ -399,7 +389,6 @@ where
         println!("{}", value);
     }
 
-    #[inline(never)]
     fn alloc(&mut self, object: Object) -> Value {
         Value::Object(self.allocator.allocate(object))
     }
