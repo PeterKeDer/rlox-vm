@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, OpCode};
-use crate::object::{Object, ObjectType, ObjectPtr, Function};
+use crate::object::{Object, ObjectType, ObjectPtr, Function, NativeFn};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -65,6 +65,8 @@ where
             let ptr = vm.alloc(obj);
             vm.singletons.push(ptr);
         }
+
+        vm.define_native("clock".to_string(), Box::new(clock_native));
 
         vm
     }
@@ -202,8 +204,8 @@ where
                     self.frame_mut().instruction_index -= offset;
                 },
                 OpCode::Call => {
-                    let arg_count = self.read_byte();
-                    self.call_value(self.peek(arg_count as usize).clone(), arg_count)?;
+                    let arg_count = self.read_byte() as usize;
+                    self.call_value(self.peek(arg_count).clone(), arg_count)?;
                 },
                 OpCode::Return => {
                     let result = self.pop();
@@ -243,6 +245,11 @@ where
         self.allocator.destroy();
     }
 
+    fn define_native(&mut self, name: String, function: NativeFn) {
+        let ptr = self.alloc(Object::Native(function));
+        self.globals.insert(name, ptr);
+    }
+
     fn values_equal(&self, a: &Object, b: &Object) -> bool {
         match (a, b) {
             (Object::Nil, Object::Nil) => true,
@@ -253,9 +260,24 @@ where
         }
     }
 
-    fn call_value(&mut self, ptr: ObjectPtr, arg_count: u8) -> Result<()> {
+    fn call_value(&mut self, ptr: ObjectPtr, arg_count: usize) -> Result<()> {
         match &*ptr {
             Object::Function(_) => self.call(ptr, arg_count),
+            Object::Native(native) => {
+                // Pop arguments and add them to vector
+                let mut args = vec![];
+                for _ in 0..arg_count {
+                    args.insert(0, self.pop());
+                }
+
+                // Pop native function
+                self.pop();
+
+                let result = native(&mut self.allocator, arg_count, args)?;
+                self.push(result);
+
+                Ok(())
+            },
             _ => Err(Error::new(
                 "Can only call functions and classes.".to_string(),
                 self.chunk().get_line(self.index()),
@@ -265,9 +287,9 @@ where
 
     /// Call a function.
     /// Precondition: the `ObjectType` of `function` is `ObjectType::Function`
-    fn call(&mut self, function: ObjectPtr, arg_count: u8) -> Result<()> {
+    fn call(&mut self, function: ObjectPtr, arg_count: usize) -> Result<()> {
         let arity = function.unwrap_function().arity;
-        if arity != arg_count {
+        if arity as usize != arg_count {
             return Err(Error::new(
                 format!("Function {} expects {} arguments but got {}.", *function, arity, arg_count),
                 self.chunk().get_line(self.index()),
@@ -382,4 +404,15 @@ fn is_falsey(value: &Object) -> bool {
         Object::Bool(false) | Object::Nil => true,
         _ => false,
     }
+}
+
+fn clock_native(allocator: &mut dyn ObjectAllocator, _arg_count: usize, _args: Vec<ObjectPtr>) -> Result<ObjectPtr> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    Ok(allocator.allocate(Object::Number(ms as f64)))
 }

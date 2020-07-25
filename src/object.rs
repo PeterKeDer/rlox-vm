@@ -2,6 +2,8 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use crate::chunk::Chunk;
+use crate::error::Result;
+use crate::allocator::ObjectAllocator;
 
 macro_rules! generate_object_enum {
     ( $( $name:ident $(($ty:ty))?, )* ) => {
@@ -24,27 +26,27 @@ macro_rules! generate_object_enum {
 
                 $(
                     #[allow(unused_parens)]
-                    pub fn [<unwrap_ $name:lower>](&self) -> &($($ty)?) {
+                    pub fn [<unwrap_ $name:snake>](&self) -> &($($ty)?) {
                         if let Object::$name $(([<value_ $ty:snake>]))* = self {
-                            &($([<value_ $ty:lower>])*)
+                            &($([<value_ $ty:snake>])*)
                         } else {
                             panic!("Tried to unwrap {} from type {:?}.", stringify!($name), self.get_type());
                         }
                     }
 
                     #[allow(unused_parens)]
-                    pub fn [<take_ $name:lower>](self) -> ($($ty)?) {
+                    pub fn [<take_ $name:snake>](self) -> ($($ty)?) {
                         if let Object::$name $(([<value_ $ty:snake>]))* = self {
-                            $([<value_ $ty:lower>])*
+                            $([<value_ $ty:snake>])*
                         } else {
                             panic!("Tried to unwrap {} from type {:?}.", stringify!($name), self.get_type());
                         }
                     }
 
                     #[allow(unused_parens)]
-                    pub fn [<as_ $name:lower>](&self) -> Option<&($($ty)?)> {
+                    pub fn [<as_ $name:snake>](&self) -> Option<&($($ty)?)> {
                         if let Object::$name $(([<value_ $ty:snake>]))* = self {
-                            Some(&($([<value_ $ty:lower>])*))
+                            Some(&($([<value_ $ty:snake>])*))
                         } else {
                             None
                         }
@@ -70,6 +72,7 @@ generate_object_enum! {
     Number(f64),
     String(String),
     Function(Function),
+    Native(NativeFn),
 }
 
 impl fmt::Display for Object {
@@ -82,7 +85,8 @@ impl fmt::Display for Object {
             Object::Function(function) => match &function.name {
                 Some(name) => write!(f, "<fn {}>", name),
                 None => write!(f, "<script>"),
-            }
+            },
+            Object::Native(_) => write!(f, "<native fn>"),
         }
     }
 }
@@ -151,3 +155,5 @@ pub enum FunctionType {
     Function,
     Script,
 }
+
+pub type NativeFn = Box<dyn Fn(&mut dyn ObjectAllocator, usize, Vec<ObjectPtr>) -> Result<ObjectPtr>>;
