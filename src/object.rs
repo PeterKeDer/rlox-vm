@@ -1,7 +1,6 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use crate::chunk::Chunk;
 use crate::error::Result;
 use crate::allocator::ObjectAllocator;
 
@@ -94,10 +93,7 @@ impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Object::String(value) => write!(f, "\"{}\"", value),
-            Object::Function(function) => match &function.name {
-                Some(name) => write!(f, "<fn {}>", name),
-                None => write!(f, "<script>"),
-            },
+            Object::Function(function) => write!(f, "{}", function),
             Object::Native(_) => write!(f, "<native  fn>"),
         }
     }
@@ -149,15 +145,24 @@ impl DerefMut for ObjectPtr {
 pub struct Function {
     pub name: Option<String>,
     pub arity: u8,
-    pub chunk: Chunk,
+    pub chunk_index: usize,
 }
 
 impl Function {
-    pub fn new(name: Option<String>, arity: u8, chunk: Chunk) -> Function {
+    pub fn new(name: Option<String>, arity: u8, chunk_index: usize) -> Function {
         Function {
             name,
             arity,
-            chunk,
+            chunk_index,
+        }
+    }
+}
+
+impl fmt::Display for Function {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "<fn {}>", name),
+            None => write!(f, "<script>"),
         }
     }
 }

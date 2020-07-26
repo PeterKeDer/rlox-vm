@@ -2,8 +2,8 @@ use std::convert::TryFrom;
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::chunk::{Chunk, OpCode};
-use crate::object::{Value, ValueType, Object, ObjectType, ObjectPtr, Function, NativeFn};
+use crate::chunk::{Chunk, Chunks, OpCode};
+use crate::object::{Value, Object, Function, NativeFn};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -14,13 +14,12 @@ macro_rules! binary_op {
 
             match (a, b) {
                 (Value::$ident_ty(a), Value::$ident_ty(b)) => Ok($vm.push(Value::$res_ty(a $op b))),
-                _ => Err(Error::new(
+                _ => $vm.error(
                     format!(
                         "The operator '{}' can only be used on two objects of type {}.",
                         stringify!($op), stringify!($ident_ty),
                     ),
-                    $vm.chunk().get_line($vm.index()),
-                )),
+                ),
             }
         }
     };
@@ -28,35 +27,51 @@ macro_rules! binary_op {
 
 static MAX_FRAMES: usize = 255;
 
-pub struct CallFrame {
-    function: ObjectPtr,
+struct CallFrame<'c> {
+    chunk: &'c Chunk,
     instruction_index: usize,
     slots_index: usize,
 }
 
-impl CallFrame {
+impl CallFrame<'_> {
     fn slot(&self, offset: usize) -> usize {
         self.slots_index + offset
     }
 }
 
-pub struct VM<Allocator: ObjectAllocator> {
-    pub allocator: Allocator,
+pub trait VMState {}
+
+pub struct VMInitializedState;
+impl VMState for VMInitializedState {}
+
+pub struct VMRunningState<'a> {
+    chunks: &'a Chunks,
     stack: Vec<Value>,
+    frames: Vec<CallFrame<'a>>,
+}
+impl<'a> VMState for VMRunningState<'a> {}
+
+pub struct VM<Allocator, State>
+where
+    Allocator: ObjectAllocator,
+    State: VMState,
+{
+    pub allocator: Allocator,
     globals: HashMap<String, Value>,
-    frames: Vec<CallFrame>,
+    state: State,
 }
 
-impl<Allocator> VM<Allocator>
+// Functions for initialized VM
+
+impl<Allocator> VM<Allocator, VMInitializedState>
 where
     Allocator: ObjectAllocator,
 {
-    pub fn new(allocator: Allocator) -> VM<Allocator> {
+    pub fn new(allocator: Allocator) -> VM<Allocator, VMInitializedState> {
         let mut vm = VM {
             allocator,
-            stack: vec![],
             globals: HashMap::new(),
-            frames: vec![],
+            state: VMInitializedState,
         };
 
         vm.define_native("clock".to_string(), Box::new(clock_native));
@@ -64,10 +79,62 @@ where
         vm
     }
 
-    pub fn interpret(&mut self, function: Function) -> Result<()> {
-        self.frames.clear();
-        self.stack.clear();
+    pub fn interpret(self,
+        function: Function,
+        chunks: &'_ Chunks,
+        print_stack_trace: bool,
+    ) -> (VM<Allocator, VMInitializedState>, Result<()>)
+    {
+        let mut vm = VM {
+            allocator: self.allocator,
+            globals: self.globals,
+            state: VMRunningState {
+                chunks,
+                stack: vec![],
+                frames: vec![],
+            },
+        };
 
+        let result = vm.run(function);
+
+        if result.is_err() && print_stack_trace {
+            vm.print_stack_trace();
+        }
+
+        let prev_vm = VM {
+            allocator: vm.allocator,
+            globals: vm.globals,
+            state: VMInitializedState,
+        };
+
+        (prev_vm, result)
+    }
+}
+
+// Functions only when VM is running
+
+impl<'a, Allocator> VM<Allocator, VMRunningState<'a>>
+where
+    Allocator: ObjectAllocator,
+{
+    pub fn print_stack_trace(&self) {
+        println!("=== Stack Trace ===");
+        println!("Printing stack trace, from last called:");
+
+        for frame in self.state.frames.iter().rev() {
+            let function = self.get(frame.slot(0)).unwrap_object().unwrap_function();
+            println!(
+                "   [line {}] in {}",
+                frame.chunk.get_line(frame.instruction_index),
+                match &function.name {
+                    Some(name) => name,
+                    None => "script",
+                },
+            );
+        }
+    }
+
+    fn run(&mut self, function: Function) -> Result<()> {
         let function = self.alloc(Object::Function(function));
         self.push(function.clone());
 
@@ -79,10 +146,7 @@ where
 
             let code = match OpCode::try_from(byte) {
                 Ok(code) => code,
-                Err(_) => return Err(Error::new(
-                    format!("Invalid byte {}.", byte),
-                    self.chunk().get_line(self.index()),
-                )),
+                Err(_) => return self.error(format!("Invalid byte {}.", byte)),
             };
 
             match code {
@@ -96,43 +160,36 @@ where
                 OpCode::Negate => {
                     match self.pop().as_number() {
                         Some(n) => self.push(Value::Number(-n)),
-                        _ => return Err(Error::new(
-                            "The '-' unary operator can only be used on numbers.".to_string(),
-                            self.chunk().get_line(self.index()),
-                        )),
+                        _ => return self.error("The '-' unary operator can only be used on numbers.".to_string()),
                     }
                 },
                 OpCode::Not => {
                     let value = self.pop();
-                    self.push(Value::Bool(is_falsey(&value)));
+                    self.push(Value::Bool(self.is_falsey(&value)));
                 },
                 OpCode::And => binary_op!(self, &&, Bool, Bool)?,
                 OpCode::Or => binary_op!(self, ||, Bool, Bool)?,
                 OpCode::Add => {
-                    match (self.peek(1).get_type(), self.peek(0).get_type()) {
-                        (ValueType::Number, ValueType::Number) => {
-                            binary_op!(self, +, Number, Number)?;
+                    let b = self.pop();
+                    let a = self.pop();
+
+                    match (a, b) {
+                        (Value::Number(a), Value::Number(b)) => {
+                            self.push(Value::Number(a + b));
                             continue;
                         },
-                        (ValueType::Object, ValueType::Object) => {
-                            match (self.peek(1).unwrap_object().get_type(), self.peek(0).unwrap_object().get_type()) {
-                                (ObjectType::String, ObjectType::String) => {
-                                    let b = self.pop();
-                                    let a = self.pop();
-                                    let string = format!("{}{}", a.unwrap_object().unwrap_string(), b.unwrap_object().unwrap_string());
-                                    self.alloc_push(Object::String(string));
-                                    continue;
-                                },
-                                _ => (),
-                            }
-                        }
+                        (Value::Object(a), Value::Object(b)) => match (&*a, &*b) {
+                            (Object::String(a), Object::String(b)) => {
+                                let string = format!("{}{}", a, b);
+                                self.alloc_push(Object::String(string));
+                                continue;
+                            },
+                            _ => (),
+                        },
                         _ => (),
                     }
 
-                    return Err(Error::new(
-                        "The '+' operator can only be used by two Strings or two Numbers.".to_string(),
-                        self.chunk().get_line(self.index()),
-                    ));
+                    return self.error("The '+' operator can only be used by two Strings or two Numbers.".to_string());
                 },
                 OpCode::Subtract => binary_op!(self, -, Number, Number)?,
                 OpCode::Multiply => binary_op!(self, *, Number, Number)?,
@@ -163,10 +220,7 @@ where
 
                     let value = match self.globals.get(name) {
                         Some(value) => value.clone(),
-                        None => return Err(Error::new(
-                            format!("Undefined variable {}.", name),
-                            self.chunk().get_line(self.index() - 1),
-                        )),
+                        None => return self.error(format!("Undefined variable '{}'.", name)),
                     };
 
                     self.push(value);
@@ -178,10 +232,7 @@ where
                     if self.globals.contains_key(&name) {
                         self.globals.insert(name, value);
                     } else {
-                        return Err(Error::new(
-                            format!("Undefined variable {}.", name),
-                            self.chunk().get_line(self.index() - 1),
-                        ));
+                        return self.error(format!("Undefined variable '{}'.", name));
                     }
                 },
                 OpCode::GetLocal => {
@@ -199,7 +250,7 @@ where
                 },
                 OpCode::JumpIfFalse => {
                     let offset = self.read_short() as usize;
-                    if is_falsey(self.peek(0)) {
+                    if self.is_falsey(self.peek(0)) {
                         self.frame_mut().instruction_index += offset;
                     }
                 },
@@ -213,15 +264,12 @@ where
                 },
                 OpCode::Return => {
                     let result = self.pop();
-
-                    let frame = self.frames.pop().unwrap();
+                    let frame = self.state.frames.pop().unwrap();
 
                     // Pop arguments passed to the function and the function itself
-                    while self.stack.len() > frame.slots_index {
-                        self.pop();
-                    }
+                    self.state.stack.truncate(frame.slots_index);
 
-                    if self.frames.is_empty() {
+                    if self.state.frames.is_empty() {
                         return Ok(());
                     }
 
@@ -231,46 +279,10 @@ where
         }
     }
 
-    pub fn print_stack_trace(&self) {
-        for frame in self.frames.iter().rev() {
-            let function = frame.function.unwrap_function();
-            println!(
-                "[line {}] in {}",
-                function.chunk.get_line(frame.instruction_index),
-                match &function.name {
-                    Some(name) => name,
-                    None => "script",
-                },
-            );
-        }
-    }
-
-    pub fn free_objects(self) {
-        self.allocator.destroy();
-    }
-
-    fn define_native(&mut self, name: String, function: NativeFn) {
-        let ptr = self.alloc(Object::Native(function));
-        self.globals.insert(name, ptr);
-    }
-
-    fn values_equal(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Object(a), Value::Object(b)) => match (&**a, &**b) {
-                (Object::String(a), Object::String(b)) => a == b,
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
     fn call_value(&mut self, value: Value, arg_count: usize) -> Result<()> {
         match value {
             Value::Object(ptr) => match &*ptr {
-                Object::Function(_) => return self.call(ptr, arg_count),
+                Object::Function(function) => return self.call_function(function, arg_count),
                 Object::Native(native) => {
                     // Pop arguments and add them to vector
                     let mut args = vec![];
@@ -291,57 +303,48 @@ where
             _ => (),
         }
 
-        Err(Error::new(
-            "Can only call functions and classes.".to_string(),
-            self.chunk().get_line(self.index()),
-        ))
+        self.error("Can only call functions and classes.".to_string())
     }
 
-    /// Call a function.
-    /// Precondition: the `ObjectType` of `function` is `ObjectType::Function`
-    fn call(&mut self, function: ObjectPtr, arg_count: usize) -> Result<()> {
-        let arity = function.unwrap_function().arity;
-        if arity as usize != arg_count {
-            return Err(Error::new(
-                format!("Function {} expects {} arguments but got {}.", *function, arity, arg_count),
-                self.chunk().get_line(self.index()),
-            ));
-        }
-
-        if self.frames.len() == MAX_FRAMES {
-            return Err(Error::new(
-                format!("Stack overflow."),
-                self.chunk().get_line(self.index()),
-            ));
+    /// Call a function by pushing a new frame.
+    fn call_function(&mut self, function: &Function, arg_count: usize) -> Result<()> {
+        if function.arity as usize != arg_count {
+            return self.error(format!("Function {} expects {} arguments but got {}.", function, function.arity, arg_count));
+        } else if self.state.frames.len() == MAX_FRAMES {
+            return self.error(format!("Stack overflow."));
         }
 
         // Push new frame
-        let frame = CallFrame {
-            function,
-            instruction_index: 0,
-            slots_index: self.stack.len() - (arg_count as usize) - 1,
-        };
-        self.frames.push(frame);
+        self.push_frame(
+            self.state.chunks.get_chunk(function.chunk_index),
+            self.state.stack.len() - arg_count - 1,
+        );
 
         Ok(())
     }
-}
 
-impl<Allocator> VM<Allocator>
-where
-    Allocator: ObjectAllocator,
-{
-    fn frame(&self) -> &CallFrame {
-        &self.frames[self.frames.len() - 1]
+    fn push_frame(&mut self, chunk: &'a Chunk, slots_index: usize) {
+        let frame = CallFrame {
+            chunk,
+            instruction_index: 0,
+            slots_index,
+        };
+        self.state.frames.push(frame);
     }
 
-    fn frame_mut(&mut self) -> &mut CallFrame {
-        let index = self.frames.len() - 1;
-        &mut self.frames[index]
+    // Utility Functions
+
+    fn frame(&self) -> &CallFrame<'a> {
+        &self.state.frames[self.state.frames.len() - 1]
     }
 
-    fn chunk(&self) -> &Chunk {
-        &self.frame().function.unwrap_function().chunk
+    fn frame_mut(&mut self) -> &mut CallFrame<'a> {
+        let index = self.state.frames.len() - 1;
+        &mut self.state.frames[index]
+    }
+
+    fn chunk(&self) -> &'a Chunk {
+        &self.frame().chunk
     }
 
     fn index(&self) -> usize {
@@ -349,23 +352,23 @@ where
     }
 
     fn pop(&mut self) -> Value {
-        self.stack.pop().unwrap()
+        self.state.stack.pop().unwrap()
     }
 
     fn push(&mut self, value: Value) {
-        self.stack.push(value);
+        self.state.stack.push(value);
     }
 
     fn get(&self, index: usize) -> &Value {
-        &self.stack[index]
+        &self.state.stack[index]
     }
 
     fn set(&mut self, index: usize, item: Value) {
-        self.stack[index] = item;
+        self.state.stack[index] = item;
     }
 
     fn peek(&self, n: usize) -> &Value {
-        &self.stack[self.stack.len() - 1 - n]
+        &self.state.stack[self.state.stack.len() - 1 - n]
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -385,6 +388,32 @@ where
         self.chunk().constants[byte as usize].clone()
     }
 
+    fn alloc_push(&mut self, object: Object) {
+        let ptr = self.alloc(object);
+        self.push(ptr);
+    }
+
+    fn error(&self, message: String) -> Result<()> {
+        Err(Error::new(message, self.chunk().get_line(self.index())))
+    }
+}
+
+// General functions that work on all states
+
+impl<Allocator, State> VM<Allocator, State>
+where
+    Allocator: ObjectAllocator,
+    State: VMState,
+{
+    pub fn free_objects(self) {
+        self.allocator.destroy();
+    }
+
+    fn define_native(&mut self, name: String, function: NativeFn) {
+        let ptr = self.alloc(Object::Native(function));
+        self.globals.insert(name, ptr);
+    }
+
     fn print_value(&self, value: &Value) {
         println!("{}", value);
     }
@@ -393,16 +422,24 @@ where
         Value::Object(self.allocator.allocate(object))
     }
 
-    fn alloc_push(&mut self, object: Object) {
-        let ptr = self.alloc(object);
-        self.push(ptr);
+    fn values_equal(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => match (&**a, &**b) {
+                (Object::String(a), Object::String(b)) => a == b,
+                _ => false,
+            },
+            _ => false,
+        }
     }
-}
 
-fn is_falsey(value: &Value) -> bool {
-    match value {
-        Value::Bool(false) | Value::Nil => true,
-        _ => false,
+    fn is_falsey(&self, value: &Value) -> bool {
+        match value {
+            Value::Bool(false) | Value::Nil => true,
+            _ => false,
+        }
     }
 }
 

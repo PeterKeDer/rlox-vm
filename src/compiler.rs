@@ -1,4 +1,3 @@
-use crate::chunk::Chunk;
 use crate::object::{Function, FunctionType};
 
 pub struct Local<'s> {
@@ -36,6 +35,7 @@ impl<'src> Compiler<'src> {
         enclosing: Option<Box<Compiler<'src>>>,
         function_type: FunctionType,
         function_name: Option<String>,
+        chunk_index: usize,
     ) -> Compiler<'src> {
         // The placeholder is reserved for the VM to put the function being executed
         let locals = vec![Local::placeholder()];
@@ -44,16 +44,8 @@ impl<'src> Compiler<'src> {
             enclosing,
             locals,
             scope_depth: 0,
-            function: Function::new(function_name, 0, Chunk::new()),
+            function: Function::new(function_name, 0, chunk_index),
             function_type,
         }
-    }
-
-    pub fn emit_byte(&mut self, byte: u8, line: usize) {
-        self.chunk().write(byte, line);
-    }
-
-    pub fn chunk(&mut self) -> &mut Chunk {
-        &mut self.function.chunk
     }
 }

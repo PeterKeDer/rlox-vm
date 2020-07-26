@@ -36,6 +36,38 @@ pub enum OpCode {
     Return,
 }
 
+pub struct Chunks {
+    pub chunks: Vec<Chunk>,
+}
+
+impl Chunks {
+    pub fn new() -> Chunks {
+        Chunks {
+            chunks: vec![],
+        }
+    }
+
+    pub fn new_chunk(&mut self) -> usize {
+        let index = self.chunks.len();
+        self.chunks.push(Chunk::new());
+        index
+    }
+
+    pub fn add_chunk(&mut self, chunk: Chunk) -> usize {
+        let index = self.chunks.len();
+        self.chunks.push(chunk);
+        index
+    }
+
+    pub fn get_chunk(&self, index: usize) -> &Chunk {
+        &self.chunks[index]
+    }
+
+    pub fn get_chunk_mut(&mut self, index: usize) -> &mut Chunk {
+        &mut self.chunks[index]
+    }
+}
+
 #[derive(Clone)]
 pub struct Chunk {
     pub code: Vec<u8>,
@@ -151,7 +183,7 @@ impl Chunk {
                 OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
                 OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
                 OpCode::Loop => self.jump_instruction("LOOP", -1, offset),
-                OpCode::Call => self.byte_instruction("CALL", offset),
+                OpCode::Call => self.constant_instruction("CALL", offset),
                 OpCode::Return => self.simple_instruction("RETURN", offset),
             },
             Err(_) => {

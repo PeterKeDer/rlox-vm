@@ -4,7 +4,7 @@ use std::convert::TryFrom;
 use num_enum::TryFromPrimitive;
 
 use crate::scanner::{Scanner, Token, TokenType};
-use crate::chunk::{Chunk, OpCode};
+use crate::chunk::{Chunk, Chunks, OpCode};
 use crate::object::{Value, Object, Function, FunctionType};
 use crate::error::{Error, Result};
 use crate::allocator::ObjectAllocator;
@@ -37,7 +37,7 @@ impl Precedence {
 
 macro_rules! parse_rules {
     ( $( $token_type:ident => ($prefix:ident, $infix:ident, $precedence:ident), )* ) => {
-        impl Parser<'_, '_> {
+        impl Parser<'_, '_, '_> {
             /// Get the corresponding infix `Precedence` for `token_type`.
             fn get_precedence(&self, token_type: TokenType) -> Precedence {
                 match token_type {
@@ -131,36 +131,36 @@ macro_rules! match_advance {
     };
 }
 
-pub struct Parser<'src, 'alloc> {
+pub struct Parser<'src, 'alloc, 'chunk> {
     allocator: &'alloc mut dyn ObjectAllocator,
     scanner: Scanner<'src>,
     compiler: Compiler<'src>,
     current: Option<Token<'src>>,
     previous: Option<Token<'src>>,
     precedence: Precedence,
+    chunks: &'chunk mut Chunks,
     has_error: bool,
 }
 
-impl Parser<'_, '_> {
-    /// Compile `Token`s from `scanner` and return the `Chunk` produced and the `ObjectPtr`s on the heap.
-    pub fn compile(scanner: Scanner<'_>, allocator: &'_ mut dyn ObjectAllocator) -> Result<Function> {
+impl Parser<'_, '_, '_> {
+    /// Parse and compile `Token`s from `scanner`, return the `Function` compiled.
+    /// Instructions are written to `chunks` and objects in constants are allocated by `allocator`.
+    pub fn parse(scanner: Scanner<'_>, allocator: &'_ mut dyn ObjectAllocator, chunks: &mut Chunks) -> Result<Function> {
+        let index = chunks.new_chunk();
+
         let mut parser = Parser {
             allocator,
             scanner,
             current: None,
-            compiler: Compiler::new(None, FunctionType::Script, None),
+            compiler: Compiler::new(None, FunctionType::Script, None, index),
             previous: None,
             precedence: Precedence::None,
+            chunks,
             has_error: false,
         };
 
-        // This initializes `current` field of `parser` by calling `next_token` on `scanner`
-        parser.advance()?;
-
         // Parses and compiles a program
         parser.program()?;
-
-        parser.emit_return();
 
         if parser.has_error {
             Err(Error::new("At least one error has occured.".to_string(), 1))
@@ -170,10 +170,14 @@ impl Parser<'_, '_> {
     }
 
     fn program(&mut self) -> Result<()> {
+        // This initializes `current` field of `parser` by calling `next_token` on `scanner`
+        self.advance()?;
+
         while !self.match_token(TokenType::EOF)? {
             self.declaration()?;
         }
 
+        self.emit_return();
         Ok(())
     }
 
@@ -184,16 +188,13 @@ impl Parser<'_, '_> {
             _ => self.statement(),
         });
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                // TODO: better error handling
-                self.has_error = true;
-                println!("[Error]: {:?}", err);
-                self.synchronize()?;
-                Ok(())
-            },
+        if let Err(error) = result {
+            self.has_error = true;
+            println!("{}", error);
+            self.synchronize()?;
         }
+
+        Ok(())
     }
 
     fn statement(&mut self) -> Result<()> {
@@ -232,7 +233,7 @@ impl Parser<'_, '_> {
     fn function(&mut self, function_type: FunctionType) -> Result<()> {
         // Create a new compiler to parse the function
         let function_name = self.previous().lexeme.to_string();
-        let compiler = Compiler::new(None, function_type, Some(function_name));
+        let compiler = Compiler::new(None, function_type, Some(function_name), self.chunks.new_chunk());
 
         // Swap in the current compiler as its enclosing
         let enclosing = mem::replace(&mut self.compiler, compiler);
@@ -664,11 +665,14 @@ impl Parser<'_, '_> {
     }
 }
 
-impl<'src> Parser<'src, '_> {
+impl<'src> Parser<'src, '_, '_> {
     fn synchronize(&mut self) -> Result<()> {
         while self.current().token_type != TokenType::EOF {
-            if self.previous().token_type == TokenType::Semicolon {
-                return Ok(());
+            // Previous is not necessarily not None here (if second token is invalid)
+            if let Some(previous) = self.previous {
+                if previous.token_type == TokenType::Semicolon {
+                    return Ok(());
+                }
             }
 
             match self.current().token_type {
@@ -752,7 +756,7 @@ impl<'src> Parser<'src, '_> {
     }
 
     fn current_chunk(&mut self) -> &mut Chunk {
-        self.compiler.chunk()
+        self.chunks.get_chunk_mut(self.compiler.function.chunk_index)
     }
 
     /// Create an constant that points to an identifier string, used for global variables.
@@ -857,7 +861,7 @@ impl<'src> Parser<'src, '_> {
 
     fn emit_byte(&mut self, byte: u8) {
         let line = self.previous().line;
-        self.compiler.emit_byte(byte, line);
+        self.current_chunk().write(byte, line);
     }
 
     fn emit_bytes(&mut self, a: u8, b: u8) {
