@@ -251,10 +251,16 @@ impl Parser<'_, '_, '_> {
         let function = self.alloc(Object::Function(prev.function));
         let constant = self.make_constant(function)?;
 
-        self.emit_bytes(OpCode::Closure as u8, constant);
+        if !prev.upvalues.is_empty() {
+            // The function needs to capture upvalues, so emit a closure
+            self.emit_bytes(OpCode::Closure as u8, constant);
 
-        for upvalue in prev.upvalues {
-            self.emit_bytes(if upvalue.is_local { 1 } else { 0 }, upvalue.index as u8);
+            for upvalue in prev.upvalues {
+                self.emit_bytes(if upvalue.is_local { 1 } else { 0 }, upvalue.index as u8);
+            }
+        } else {
+            // Emit the function as a constant
+            self.emit_bytes(OpCode::Constant as u8, constant);
         }
 
         result

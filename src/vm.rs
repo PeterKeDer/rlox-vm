@@ -145,16 +145,17 @@ where
         println!("Printing stack trace, from last called:");
 
         for frame in self.state.frames.iter().rev() {
-            let function = self.get(frame.slot(0))
-                .unwrap_object()
-                .unwrap_closure()
-                .function
-                .unwrap_function();
+            // Can either be a closure or a function
+            let name = match &**self.get(frame.slot(0)).unwrap_object() {
+                Object::Function(function) => &function.name,
+                Object::Closure(closure) => &closure.function.unwrap_function().name,
+                x => panic!("Expect Function or Closure type in callee spot, got type {:?}", x.get_type()),
+            };
 
             println!(
                 "   [line {}] in {}",
                 frame.chunk.get_line(frame.instruction_index),
-                match &function.name {
+                match name {
                     Some(name) => name,
                     None => "script",
                 },
@@ -164,11 +165,10 @@ where
 
     fn run(&mut self, function: Function) -> Result<()> {
         let function = self.alloc(Object::Function(function));
-        let closure = self.alloc(Object::Closure(Closure::new(function.take_object(), vec![])));
-        self.push(closure.clone());
+        self.push(function.clone());
 
         // Create and push the call frame
-        self.call_value(closure, 0)?;
+        self.call_value(function, 0)?;
 
         loop {
             let byte = self.read_byte();
@@ -420,8 +420,8 @@ where
     fn call_value(&mut self, value: Value, arg_count: usize) -> Result<()> {
         match value {
             Value::Object(ptr) => match &*ptr {
-                // Object::Function(function) => return self.call_function(function, arg_count),
-                Object::Closure(closure) => return self.call_closure(closure, arg_count),
+                Object::Function(function) => return self.call_function(function, arg_count),
+                Object::Closure(closure) => return self.call_function(closure.function.unwrap_function(), arg_count),
                 Object::Native(native) => {
                     // Pop arguments and add them to vector
                     let mut args = vec![];
@@ -445,10 +445,8 @@ where
         self.error("Can only call functions and classes.".to_string())
     }
 
-    /// Call a closure by pushing a new frame.
-    fn call_closure(&mut self, closure: &Closure, arg_count: usize) -> Result<()> {
-        let function = closure.function.unwrap_function();
-
+    /// Call a function by pushing a new frame.
+    fn call_function(&mut self, function: &Function, arg_count: usize) -> Result<()> {
         if function.arity as usize != arg_count {
             return self.error(format!("Function {} expects {} arguments but got {}.", function, function.arity, arg_count));
         } else if self.state.frames.len() == MAX_FRAMES {
