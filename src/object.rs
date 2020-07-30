@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::cell::RefCell;
 
 use crate::error::Result;
 use crate::allocator::ObjectAllocator;
@@ -63,7 +64,7 @@ macro_rules! generate_enum {
     };
 }
 
-generate_enum!(Value | ValueType, derive(Clone) {
+generate_enum!(Value | ValueType, derive(Debug, Clone, PartialEq) {
     Nil,
     Bool(bool),
     Number(f64),
@@ -81,12 +82,16 @@ impl fmt::Display for Value {
     }
 }
 
+type RefCellUpvalue = RefCell<Upvalue>;
+
 // This generates the enums `Object` and `ObjectType`.
 // Implements methods `get_type`, `unwrap_<variant>`, `take_<variant>`, and `as_<variant>` for `Object`.
 generate_enum!(Object | ObjectType, {
     String(String),
     Function(Function),
     Native(NativeFn),
+    Closure(Closure),
+    Upvalue(RefCellUpvalue),
 });
 
 impl fmt::Display for Object {
@@ -94,7 +99,9 @@ impl fmt::Display for Object {
         match self {
             Object::String(value) => write!(f, "\"{}\"", value),
             Object::Function(function) => write!(f, "{}", function),
-            Object::Native(_) => write!(f, "<native  fn>"),
+            Object::Native(_) => write!(f, "<native fn>"),
+            Object::Closure(closure) => write!(f, "{}", closure),
+            Object::Upvalue(upvalue) => write!(f, "Upvalue {:?}", upvalue.borrow()),
         }
     }
 }
@@ -146,6 +153,7 @@ pub struct Function {
     pub name: Option<String>,
     pub arity: u8,
     pub chunk_index: usize,
+    pub upvalue_count: usize,
 }
 
 impl Function {
@@ -154,6 +162,7 @@ impl Function {
             name,
             arity,
             chunk_index,
+            upvalue_count: 0,
         }
     }
 }
@@ -174,3 +183,30 @@ pub enum FunctionType {
 }
 
 pub type NativeFn = Box<dyn Fn(&mut dyn ObjectAllocator, usize, Vec<Value>) -> Result<Value>>;
+
+pub struct Closure {
+    pub function: ObjectPtr,
+    pub upvalues: Vec<ObjectPtr>,
+}
+
+impl Closure {
+    // `function` must have `ObjectType::Function`.
+    pub fn new(function: ObjectPtr, upvalues: Vec<ObjectPtr>) -> Closure {
+        Closure {
+            function,
+            upvalues,
+        }
+    }
+}
+
+impl fmt::Display for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.function.unwrap_function())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Upvalue {
+    Open(usize),
+    Closed(Value),
+}

@@ -29,11 +29,15 @@ pub enum OpCode {
     SetGlobal,
     GetLocal,
     SetLocal,
+    GetUpvalue,
+    SetUpvalue,
     Jump,
     JumpIfFalse,
     Loop,
     Call,
     Return,
+    Closure,
+    CloseUpvalue,
 }
 
 pub struct Chunks {
@@ -180,11 +184,31 @@ impl Chunk {
                 OpCode::SetGlobal => self.constant_instruction("SET_GLOBAL", offset),
                 OpCode::GetLocal => self.byte_instruction("GET_LOCAL", offset),
                 OpCode::SetLocal => self.byte_instruction("SET_LOCAL", offset),
+                OpCode::GetUpvalue => self.byte_instruction("GET_UPVALUE", offset),
+                OpCode::SetUpvalue => self.byte_instruction("SET_UPVALUE", offset),
                 OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
                 OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
                 OpCode::Loop => self.jump_instruction("LOOP", -1, offset),
-                OpCode::Call => self.constant_instruction("CALL", offset),
+                OpCode::Call => self.byte_instruction("CALL", offset),
                 OpCode::Return => self.simple_instruction("RETURN", offset),
+                OpCode::Closure => {
+                    let constant = self.code[*offset + 1];
+                    let constant_value = &self.constants[constant as usize];
+                    println!("{:<16} {:4} '{}'", "CLOSURE", constant, constant_value);
+                    *offset += 2;
+
+                    for _ in 0..constant_value.unwrap_object().unwrap_function().upvalue_count {
+                        let is_local = self.code[*offset] == 1;
+                        let index = self.code[*offset + 1];
+                        println!("{:04}      |                     {} {}",
+                            offset,
+                            if is_local { "local" } else { "upvalue" },
+                            index,
+                        );
+                        *offset += 2;
+                      }
+                },
+                OpCode::CloseUpvalue => self.simple_instruction("CLOSE_UPVALUE", offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);

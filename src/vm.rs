@@ -1,9 +1,13 @@
+use std::mem;
 use std::convert::TryFrom;
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
 
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, Chunks, OpCode};
-use crate::object::{Value, Object, Function, NativeFn};
+use crate::object::{Value, Object, Function, NativeFn, Closure, ObjectPtr, Upvalue};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -44,10 +48,28 @@ pub trait VMState {}
 pub struct VMInitializedState;
 impl VMState for VMInitializedState {}
 
+#[derive(Debug)]
+struct ObjectPtrElement {
+    link: LinkedListLink,
+    value: ObjectPtr,
+}
+
+impl ObjectPtrElement {
+    fn new(value: ObjectPtr) -> ObjectPtrElement {
+        ObjectPtrElement {
+            link: LinkedListLink::new(),
+            value,
+        }
+    }
+}
+
+intrusive_adapter!(ObjectPtrAdapter = Box<ObjectPtrElement>: ObjectPtrElement { link: LinkedListLink });
+
 pub struct VMRunningState<'a> {
     chunks: &'a Chunks,
     stack: Vec<Value>,
     frames: Vec<CallFrame<'a>>,
+    open_upvalues: LinkedList<ObjectPtrAdapter>,
 }
 impl<'a> VMState for VMRunningState<'a> {}
 
@@ -92,6 +114,7 @@ where
                 chunks,
                 stack: vec![],
                 frames: vec![],
+                open_upvalues: LinkedList::new(ObjectPtrAdapter::new()),
             },
         };
 
@@ -122,7 +145,12 @@ where
         println!("Printing stack trace, from last called:");
 
         for frame in self.state.frames.iter().rev() {
-            let function = self.get(frame.slot(0)).unwrap_object().unwrap_function();
+            let function = self.get(frame.slot(0))
+                .unwrap_object()
+                .unwrap_closure()
+                .function
+                .unwrap_function();
+
             println!(
                 "   [line {}] in {}",
                 frame.chunk.get_line(frame.instruction_index),
@@ -136,10 +164,11 @@ where
 
     fn run(&mut self, function: Function) -> Result<()> {
         let function = self.alloc(Object::Function(function));
-        self.push(function.clone());
+        let closure = self.alloc(Object::Closure(Closure::new(function.take_object(), vec![])));
+        self.push(closure.clone());
 
         // Create and push the call frame
-        self.call_value(function, 0)?;
+        self.call_value(closure, 0)?;
 
         loop {
             let byte = self.read_byte();
@@ -244,6 +273,36 @@ where
                     // Peek is used here since assignments are also expressions
                     self.set(self.frame().slot(slot), self.peek(0).clone());
                 },
+                OpCode::GetUpvalue => {
+                    let slot = self.read_byte() as usize;
+
+                    let upvalue = self.closure().upvalues[slot].unwrap_upvalue().borrow();
+
+                    let value = match &*upvalue {
+                        Upvalue::Open(index) => self.get(*index).clone(),
+                        Upvalue::Closed(value) => value.clone(),
+                    };
+
+                    mem::drop(upvalue);
+                    self.push(value);
+                },
+                OpCode::SetUpvalue => {
+                    let slot = self.read_byte() as usize;
+                    let value = self.peek(0).clone();
+
+                    let mut upvalue = self.closure().upvalues[slot].unwrap_upvalue().borrow_mut();
+
+                    match &*upvalue {
+                        Upvalue::Open(index) => {
+                            let index = *index;
+                            mem::drop(upvalue);
+                            self.set(index, value);
+                        },
+                        Upvalue::Closed(_) => {
+                            *upvalue = Upvalue::Closed(value);
+                        },
+                    }
+                },
                 OpCode::Jump => {
                     let offset = self.read_short() as usize;
                     self.frame_mut().instruction_index += offset;
@@ -266,6 +325,9 @@ where
                     let result = self.pop();
                     let frame = self.state.frames.pop().unwrap();
 
+                    // Close all open upvalues whose values will be poppped from the stack
+                    self.close_upvalues(frame.slots_index);
+
                     // Pop arguments passed to the function and the function itself
                     self.state.stack.truncate(frame.slots_index);
 
@@ -275,14 +337,91 @@ where
 
                     self.push(result);
                 },
+                OpCode::Closure => {
+                    let ptr = self.read_constant().unwrap_object().clone();
+                    let function = ptr.unwrap_function();
+
+                    let upvalues = (0..function.upvalue_count)
+                        .map(|_| {
+                            let is_local = self.read_byte() == 1;
+                            let index = self.read_byte();
+
+                            if is_local {
+                                self.capture_upvalue(self.frame().slot(index as usize))
+                            } else {
+                                self.closure().upvalues[index as usize].clone()
+                            }
+                        })
+                        .collect();
+
+                    let closure = Closure::new(ptr, upvalues);
+                    self.alloc_push(Object::Closure(closure));
+                },
+                OpCode::CloseUpvalue => {
+                    self.close_upvalues(self.state.stack.len() - 1);
+                    self.pop();
+                },
             }
+        }
+    }
+
+    /// Capture the value at `index` on the stack as an open upvalue.
+    fn capture_upvalue(&mut self, index: usize) -> ObjectPtr {
+        let mut cursor = self.state.open_upvalues.front_mut();
+
+        while let Some(next) = cursor.get() {
+            match *next.value.unwrap_upvalue().borrow() {
+                Upvalue::Open(location) => {
+                    if location == index {
+                        // Found the upvalue
+                        return next.value.clone();
+
+                    } else if location < index {
+                        // Went past the required stack location, so create new upvalue
+                        break;
+                    }
+                },
+                Upvalue::Closed(_) => panic!("Closed upvalue found in 'open_upvalues'."),
+            }
+            cursor.move_next();
+        }
+
+        let upvalue = self.allocator.allocate(Object::Upvalue(RefCell::new(Upvalue::Open(index))));
+
+        cursor.insert_before(Box::new(ObjectPtrElement::new(upvalue.clone())));
+
+        upvalue
+    }
+
+    /// Pop and close all open upvalues whose `location` is less than or equal to `index`.
+    fn close_upvalues(&mut self, index: usize) {
+        let mut cursor = self.state.open_upvalues.front_mut();
+
+        while let Some(next) = cursor.get() {
+            let location = match *next.value.unwrap_upvalue().borrow() {
+                Upvalue::Open(location) => {
+                    if location < index {
+                        // Went past index, stop popping
+                        break;
+                    }
+
+                    location
+                },
+                Upvalue::Closed(_) => panic!("Closed upvalue found in 'open_upvalues'."),
+            };
+
+            let value = self.state.stack[location].clone();
+
+            // Close the upvalue by setting object pointed
+            *cursor.remove().unwrap().value.unwrap_upvalue().borrow_mut() = Upvalue::Closed(value);
         }
     }
 
     fn call_value(&mut self, value: Value, arg_count: usize) -> Result<()> {
         match value {
             Value::Object(ptr) => match &*ptr {
-                Object::Function(function) => return self.call_function(function, arg_count),
+                // Object::Function(function) => return self.call_function(function, arg_count),
+                Object::Closure(closure) => return self.call_closure(closure, arg_count),
                 Object::Native(native) => {
                     // Pop arguments and add them to vector
                     let mut args = vec![];
@@ -306,8 +445,10 @@ where
         self.error("Can only call functions and classes.".to_string())
     }
 
-    /// Call a function by pushing a new frame.
-    fn call_function(&mut self, function: &Function, arg_count: usize) -> Result<()> {
+    /// Call a closure by pushing a new frame.
+    fn call_closure(&mut self, closure: &Closure, arg_count: usize) -> Result<()> {
+        let function = closure.function.unwrap_function();
+
         if function.arity as usize != arg_count {
             return self.error(format!("Function {} expects {} arguments but got {}.", function, function.arity, arg_count));
         } else if self.state.frames.len() == MAX_FRAMES {
@@ -345,6 +486,10 @@ where
 
     fn chunk(&self) -> &'a Chunk {
         &self.frame().chunk
+    }
+
+    fn closure(&self) -> &Closure {
+        self.state.stack[self.frame().slots_index].unwrap_object().unwrap_closure()
     }
 
     fn index(&self) -> usize {
@@ -419,7 +564,11 @@ where
     }
 
     fn alloc(&mut self, object: Object) -> Value {
-        Value::Object(self.allocator.allocate(object))
+        Value::Object(self.alloc_obj(object))
+    }
+
+    fn alloc_obj(&mut self, object: Object) -> ObjectPtr {
+        self.allocator.allocate(object)
     }
 
     fn values_equal(&self, a: &Value, b: &Value) -> bool {

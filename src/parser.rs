@@ -8,7 +8,7 @@ use crate::chunk::{Chunk, Chunks, OpCode};
 use crate::object::{Value, Object, Function, FunctionType};
 use crate::error::{Error, Result};
 use crate::allocator::ObjectAllocator;
-use crate::compiler::{Compiler, Local};
+use crate::compiler::Compiler;
 
 /// Parsing precedence, from lowest to highest.
 #[derive(Debug, TryFromPrimitive, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -247,9 +247,17 @@ impl Parser<'_, '_, '_> {
 
         let enclosing = *mem::replace(&mut self.compiler.enclosing, None).unwrap();
         let prev = mem::replace(&mut self.compiler, enclosing);
-        let function = self.alloc(Object::Function(prev.function));
 
-        self.emit_constant(function).or(result)
+        let function = self.alloc(Object::Function(prev.function));
+        let constant = self.make_constant(function)?;
+
+        self.emit_bytes(OpCode::Closure as u8, constant);
+
+        for upvalue in prev.upvalues {
+            self.emit_bytes(if upvalue.is_local { 1 } else { 0 }, upvalue.index as u8);
+        }
+
+        result
     }
 
     fn function_util(&mut self) -> Result<()> {
@@ -635,11 +643,17 @@ impl Parser<'_, '_, '_> {
 
     /// Emit bytecode to get or set a variable with name.
     fn named_variable(&mut self, name: Token<'_>) -> Result<()> {
-        let (get_op, set_op, arg) = match self.resolve_local(name)? {
+        let (get_op, set_op, arg) = match self.compiler.resolve_local(&name)? {
             // Get/set local variable by index on the stack
             Some(index) => (OpCode::GetLocal, OpCode::SetLocal, index as u8),
-            // Get/set global variable with a pointer to its name
-            None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.to_string())?),
+
+            None => match self.compiler.resolve_upvalue(&name)? {
+                // Get/set upvalue with index to upvalue
+                Some(upvalue) => (OpCode::GetUpvalue, OpCode::SetUpvalue, upvalue as u8),
+
+                // Get/set global variable with a pointer to its name
+                None => (OpCode::GetGlobal, OpCode::SetGlobal, self.identifier_constant(name.lexeme.to_string())?),
+            }
         };
 
         if self.precedence <= Precedence::Assignment && self.match_token(TokenType::Equal)? {
@@ -712,8 +726,13 @@ impl<'src> Parser<'src, '_, '_> {
                 break;
             }
 
-            self.compiler.locals.pop();
-            self.emit_byte(OpCode::Pop as u8);
+            let local = self.compiler.locals.pop().unwrap();
+
+            if local.is_captured {
+                self.emit_byte(OpCode::CloseUpvalue as u8);
+            } else {
+                self.emit_byte(OpCode::Pop as u8);
+            }
         }
     }
 
@@ -791,39 +810,8 @@ impl<'src> Parser<'src, '_, '_> {
             }
         }
 
-        self.add_local(name)?;
+        self.compiler.add_local(name)?;
         Ok(())
-    }
-
-    fn add_local(&mut self, name: Token<'src>) -> Result<()> {
-        // There are a max number of local variables (for now) since bytecode are u8
-        if self.compiler.locals.len() > u8::MAX as usize {
-            return Err(Error::new(
-                "Too many local variables.".to_string(),
-                name.line,
-            ));
-        }
-
-        let local = Local::new(name.lexeme, None);
-        self.compiler.locals.push(local);
-        Ok(())
-    }
-
-    fn resolve_local(&mut self, name: Token<'_>) -> Result<Option<usize>> {
-        for (index, local) in self.compiler.locals.iter().enumerate().rev() {
-            if name.lexeme == local.name {
-                if local.depth.is_none() {
-                    return Err(Error::new(
-                        format!("Cannot use variable '{}' in its own initializer.", name.lexeme),
-                        name.line,
-                    ));
-                } else {
-                    return Ok(Some(index));
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     /// Emit the bytecode that defines a variable.
