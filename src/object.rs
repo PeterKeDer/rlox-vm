@@ -2,6 +2,8 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::cell::RefCell;
 
+use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
+
 use crate::error::Result;
 use crate::allocator::ObjectAllocator;
 
@@ -106,21 +108,47 @@ impl fmt::Display for Object {
     }
 }
 
+pub struct ObjectWrapper {
+    object: Object,
+    pub is_marked: bool,
+}
+
+impl ObjectWrapper {
+    fn new(object: Object) -> ObjectWrapper {
+        ObjectWrapper {
+            object,
+            is_marked: false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ObjectPtr {
-    ptr: *mut Object,
+    ptr: *mut ObjectWrapper,
 }
 
 impl ObjectPtr {
     pub fn alloc(object: Object) -> ObjectPtr {
         ObjectPtr {
-            ptr: Box::into_raw(Box::new(object)),
+            ptr: Box::into_raw(Box::new(ObjectWrapper::new(object))),
         }
     }
 
     pub fn dealloc(ptr: ObjectPtr) {
         unsafe {
             Box::from_raw(ptr.ptr);
+        }
+    }
+
+    pub fn deref_wrapper(&self) -> &ObjectWrapper {
+        unsafe {
+            &*self.ptr
+        }
+    }
+
+    pub fn deref_wrapper_mut(&mut self) -> &mut ObjectWrapper {
+        unsafe {
+            &mut *self.ptr
         }
     }
 }
@@ -136,7 +164,7 @@ impl Deref for ObjectPtr {
 
     fn deref(&self) -> &Object {
         unsafe {
-            &*self.ptr
+            &(*self.ptr).object
         }
     }
 }
@@ -144,10 +172,29 @@ impl Deref for ObjectPtr {
 impl DerefMut for ObjectPtr {
     fn deref_mut(&mut self) -> &mut Object {
         unsafe {
-            &mut *self.ptr
+            &mut (*self.ptr).object
         }
     }
 }
+
+#[derive(Debug)]
+pub struct ObjectPtrElement {
+    pub link: LinkedListLink,
+    pub value: ObjectPtr,
+}
+
+impl ObjectPtrElement {
+    pub fn new(value: ObjectPtr) -> ObjectPtrElement {
+        ObjectPtrElement {
+            link: LinkedListLink::new(),
+            value,
+        }
+    }
+}
+
+intrusive_adapter!(pub ObjectPtrAdapter = Box<ObjectPtrElement>: ObjectPtrElement { link: LinkedListLink });
+
+pub type ObjectPtrLinkedList = LinkedList<ObjectPtrAdapter>;
 
 pub struct Function {
     pub name: Option<String>,

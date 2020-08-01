@@ -3,11 +3,10 @@ use std::convert::TryFrom;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
-
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, Chunks, OpCode};
-use crate::object::{Value, Object, Function, NativeFn, Closure, ObjectPtr, Upvalue};
+use crate::object::{Value, Object, Function, NativeFn, Closure, ObjectPtr, Upvalue,
+                    ObjectPtrElement, ObjectPtrLinkedList, ObjectPtrAdapter};
 use crate::allocator::ObjectAllocator;
 
 macro_rules! binary_op {
@@ -29,7 +28,7 @@ macro_rules! binary_op {
     };
 }
 
-static MAX_FRAMES: usize = 255;
+const MAX_FRAMES: usize = 255;
 
 struct CallFrame<'c> {
     chunk: &'c Chunk,
@@ -48,28 +47,11 @@ pub trait VMState {}
 pub struct VMInitializedState;
 impl VMState for VMInitializedState {}
 
-#[derive(Debug)]
-struct ObjectPtrElement {
-    link: LinkedListLink,
-    value: ObjectPtr,
-}
-
-impl ObjectPtrElement {
-    fn new(value: ObjectPtr) -> ObjectPtrElement {
-        ObjectPtrElement {
-            link: LinkedListLink::new(),
-            value,
-        }
-    }
-}
-
-intrusive_adapter!(ObjectPtrAdapter = Box<ObjectPtrElement>: ObjectPtrElement { link: LinkedListLink });
-
 pub struct VMRunningState<'a> {
     chunks: &'a Chunks,
     stack: Vec<Value>,
     frames: Vec<CallFrame<'a>>,
-    open_upvalues: LinkedList<ObjectPtrAdapter>,
+    open_upvalues: ObjectPtrLinkedList,
 }
 impl<'a> VMState for VMRunningState<'a> {}
 
@@ -107,16 +89,12 @@ where
         print_stack_trace: bool,
     ) -> (VM<Allocator, VMInitializedState>, Result<()>)
     {
-        let mut vm = VM {
-            allocator: self.allocator,
-            globals: self.globals,
-            state: VMRunningState {
-                chunks,
-                stack: vec![],
-                frames: vec![],
-                open_upvalues: LinkedList::new(ObjectPtrAdapter::new()),
-            },
-        };
+        let mut vm = self.with_state(VMRunningState {
+            chunks,
+            stack: vec![],
+            frames: vec![],
+            open_upvalues: ObjectPtrLinkedList::new(ObjectPtrAdapter::new()),
+        });
 
         let result = vm.run(function);
 
@@ -124,13 +102,7 @@ where
             vm.print_stack_trace();
         }
 
-        let prev_vm = VM {
-            allocator: vm.allocator,
-            globals: vm.globals,
-            state: VMInitializedState,
-        };
-
-        (prev_vm, result)
+        (vm.with_state(VMInitializedState), result)
     }
 }
 
@@ -164,7 +136,7 @@ where
     }
 
     fn run(&mut self, function: Function) -> Result<()> {
-        let function = self.alloc(Object::Function(function));
+        let function = Value::Object(self.allocator.allocate(Object::Function(function)));
         self.push(function.clone());
 
         // Create and push the call frame
@@ -531,6 +503,39 @@ where
         self.chunk().constants[byte as usize].clone()
     }
 
+    fn alloc(&mut self, object: Object) -> Value {
+        Value::Object(self.alloc_obj(object))
+    }
+
+    fn alloc_obj(&mut self, object: Object) -> ObjectPtr {
+        // Collect garbage if exceeded number of objects allocated
+        if self.allocator.should_trigger_gc() {
+            let mut roots = vec![];
+
+            for value in &self.state.stack {
+                if let Some(object) = value.as_object() {
+                    roots.push(object.clone());
+                }
+            }
+
+            for (_, value) in &self.globals {
+                if let Some(object) = value.as_object() {
+                    roots.push(object.clone());
+                }
+            }
+
+            // TODO: call frame's closure shouldn't be needed, since it's stored on the stack?
+
+            for upvalue in &self.state.open_upvalues {
+                roots.push(upvalue.value.clone());
+            }
+
+            self.allocator.collect_garbage(&roots, &self.state.chunks.chunks);
+        }
+
+        self.allocator.allocate(object)
+    }
+
     fn alloc_push(&mut self, object: Object) {
         let ptr = self.alloc(object);
         self.push(ptr);
@@ -552,21 +557,16 @@ where
         self.allocator.destroy();
     }
 
-    fn define_native(&mut self, name: String, function: NativeFn) {
-        let ptr = self.alloc(Object::Native(function));
-        self.globals.insert(name, ptr);
+    fn with_state<NewState: VMState>(self, state: NewState) -> VM<Allocator, NewState> {
+        VM {
+            allocator: self.allocator,
+            globals: self.globals,
+            state,
+        }
     }
 
     fn print_value(&self, value: &Value) {
         println!("{}", value);
-    }
-
-    fn alloc(&mut self, object: Object) -> Value {
-        Value::Object(self.alloc_obj(object))
-    }
-
-    fn alloc_obj(&mut self, object: Object) -> ObjectPtr {
-        self.allocator.allocate(object)
     }
 
     fn values_equal(&self, a: &Value, b: &Value) -> bool {
@@ -587,6 +587,12 @@ where
             Value::Bool(false) | Value::Nil => true,
             _ => false,
         }
+    }
+
+    fn define_native(&mut self, name: String, function: NativeFn) {
+        // No need to trigger garbage collection here, since native functions are defined when VM starts
+        let ptr = self.allocator.allocate(Object::Native(function));
+        self.globals.insert(name, Value::Object(ptr));
     }
 }
 
