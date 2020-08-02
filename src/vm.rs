@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::chunk::{Chunk, Chunks, OpCode};
-use crate::object::{Value, Object, Function, NativeFn, Closure, ObjectPtr, Upvalue,
+use crate::object::{Value, Object, Function, NativeFn, Closure, Class, Instance, ObjectPtr, Upvalue,
                     ObjectPtrElement, ObjectPtrLinkedList, ObjectPtrAdapter};
 use crate::allocator::ObjectAllocator;
 
@@ -275,6 +275,35 @@ where
                         },
                     }
                 },
+                OpCode::GetProperty => {
+                    let value = self.read_constant();
+                    let property = value.unwrap_object().unwrap_string();
+
+                    if let Some(Some(instance)) = self.pop().as_object().map(|ptr| ptr.as_instance()) {
+                        if let Some(value) = instance.borrow().fields.get(property) {
+                            self.push(value.clone());
+                        } else {
+                            return self.error(format!("Undefined property '{}'.", property));
+                        }
+                    } else {
+                        return self.error(format!("Cannot get property of non-instance object."));
+                    }
+                },
+                OpCode::SetProperty => {
+                    let property = self.read_constant().unwrap_object().unwrap_string().clone();
+
+                    if let Some(Some(instance)) = self.peek(1).as_object().map(|ptr| ptr.as_instance()) {
+                        let mut instance = instance.borrow_mut();
+                        instance.fields.insert(property, self.peek(0).clone());
+
+                    } else {
+                        return self.error(format!("Cannot get property of non-instance object."));
+                    }
+
+                    let value = self.pop();
+                    self.pop();
+                    self.push(value);
+                },
                 OpCode::Jump => {
                     let offset = self.read_short() as usize;
                     self.frame_mut().instruction_index += offset;
@@ -332,6 +361,11 @@ where
                 OpCode::CloseUpvalue => {
                     self.close_upvalues(self.state.stack.len() - 1);
                     self.pop();
+                },
+                OpCode::Class => {
+                    let name = self.read_constant().unwrap_object().unwrap_string().clone();
+                    let class = Object::Class(Class::new(name));
+                    self.alloc_push(class);
                 },
             }
         }
@@ -406,6 +440,19 @@ where
 
                     let result = native(&mut self.allocator, arg_count, args)?;
                     self.push(result);
+
+                    return Ok(());
+                },
+                Object::Class(_) => {
+                    let instance = Object::Instance(RefCell::new(Instance::new(ptr.clone())));
+
+                    // Consume arguments
+                    let mut args = vec![];
+                    for _ in 0..arg_count {
+                        args.insert(0, self.pop());
+                    }
+
+                    self.alloc_push(instance);
 
                     return Ok(());
                 },

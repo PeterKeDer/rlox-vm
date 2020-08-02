@@ -109,6 +109,18 @@ impl<'a> GarbageCollector<'a> {
                     for upvalue in &closure.upvalues {
                         self.mark_object(upvalue.clone());
                     }
+                },
+                Object::Class(_class) => {
+                    // TODO: after adding methods
+                },
+                Object::Instance(instance) => {
+                    let instance = instance.borrow();
+
+                    self.mark_object(instance.class.clone());
+
+                    for field in instance.fields.values() {
+                        self.mark_value(field);
+                    }
                 }
                 // No references in these types of objects
                 _ => (),

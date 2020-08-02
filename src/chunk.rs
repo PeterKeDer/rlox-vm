@@ -31,6 +31,8 @@ pub enum OpCode {
     SetLocal,
     GetUpvalue,
     SetUpvalue,
+    GetProperty,
+    SetProperty,
     Jump,
     JumpIfFalse,
     Loop,
@@ -38,6 +40,7 @@ pub enum OpCode {
     Return,
     Closure,
     CloseUpvalue,
+    Class,
 }
 
 pub struct Chunks {
@@ -186,6 +189,8 @@ impl Chunk {
                 OpCode::SetLocal => self.byte_instruction("SET_LOCAL", offset),
                 OpCode::GetUpvalue => self.byte_instruction("GET_UPVALUE", offset),
                 OpCode::SetUpvalue => self.byte_instruction("SET_UPVALUE", offset),
+                OpCode::GetProperty => self.constant_instruction("GET_PROPERTY", offset),
+                OpCode::SetProperty => self.constant_instruction("SET_PROPERTY", offset),
                 OpCode::Jump => self.jump_instruction("JUMP", 1, offset),
                 OpCode::JumpIfFalse => self.jump_instruction("JUMP_IF_FALSE", 1, offset),
                 OpCode::Loop => self.jump_instruction("LOOP", -1, offset),
@@ -209,6 +214,7 @@ impl Chunk {
                       }
                 },
                 OpCode::CloseUpvalue => self.simple_instruction("CLOSE_UPVALUE", offset),
+                OpCode::Class => self.constant_instruction("CLASS", offset),
             },
             Err(_) => {
                 println!("Unknown opcode {}", instruction);

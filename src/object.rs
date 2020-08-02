@@ -1,6 +1,7 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
 
@@ -85,6 +86,7 @@ impl fmt::Display for Value {
 }
 
 type RefCellUpvalue = RefCell<Upvalue>;
+type RefCellInstance = RefCell<Instance>;
 
 // This generates the enums `Object` and `ObjectType`.
 // Implements methods `get_type`, `unwrap_<variant>`, `take_<variant>`, and `as_<variant>` for `Object`.
@@ -94,6 +96,8 @@ generate_enum!(Object | ObjectType, {
     Native(NativeFn),
     Closure(Closure),
     Upvalue(RefCellUpvalue),
+    Class(Class),
+    Instance(RefCellInstance),
 });
 
 impl fmt::Display for Object {
@@ -104,6 +108,8 @@ impl fmt::Display for Object {
             Object::Native(_) => write!(f, "<native fn>"),
             Object::Closure(closure) => write!(f, "{}", closure),
             Object::Upvalue(upvalue) => write!(f, "Upvalue {:?}", upvalue.borrow()),
+            Object::Class(class) => write!(f, "{}", class.name),
+            Object::Instance(instance) => write!(f, "{} instance", instance.borrow().class.unwrap_class().name),
         }
     }
 }
@@ -256,4 +262,30 @@ impl fmt::Display for Closure {
 pub enum Upvalue {
     Open(usize),
     Closed(Value),
+}
+
+pub struct Class {
+    pub name: String,
+}
+
+impl Class {
+    pub fn new(name: String) -> Class {
+        Class {
+            name,
+        }
+    }
+}
+
+pub struct Instance {
+    pub class: ObjectPtr,
+    pub fields: HashMap<String, Value>,
+}
+
+impl Instance {
+    pub fn new(class: ObjectPtr) -> Instance {
+        Instance {
+            class,
+            fields: HashMap::new(),
+        }
+    }
 }

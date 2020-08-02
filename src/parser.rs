@@ -78,7 +78,7 @@ parse_rules! {
     LeftBrace       => (none,       none,       None        ),
     RightBrace      => (none,       none,       None        ),
     Comma           => (none,       none,       None        ),
-    Dot             => (none,       none,       None        ),
+    Dot             => (none,       dot,        Call        ),
     Minus           => (unary,      binary,     Term        ),
     Plus            => (none,       binary,     Term        ),
     Semicolon       => (none,       none,       None        ),
@@ -137,7 +137,7 @@ pub struct Parser<'src, 'alloc, 'chunk> {
     compiler: Compiler<'src>,
     current: Option<Token<'src>>,
     previous: Option<Token<'src>>,
-    precedence: Precedence,
+    can_assign: bool,
     chunks: &'chunk mut Chunks,
     has_error: bool,
 }
@@ -154,7 +154,7 @@ impl Parser<'_, '_, '_> {
             current: None,
             compiler: Compiler::new(None, FunctionType::Script, None, index),
             previous: None,
-            precedence: Precedence::None,
+            can_assign: true,
             chunks,
             has_error: false,
         };
@@ -183,8 +183,9 @@ impl Parser<'_, '_, '_> {
 
     fn declaration(&mut self) -> Result<()> {
         let result = match_advance!(self, {
-            Var => self.variable_declaration(),
+            Class => self.class_declaration(),
             Fun => self.function_declaration(),
+            Var => self.variable_declaration(),
             _ => self.statement(),
         });
 
@@ -218,6 +219,21 @@ impl Parser<'_, '_, '_> {
 
         self.consume(TokenType::RightBrace, "Expect '}' after block.".to_string())?;
         self.end_scope();
+
+        Ok(())
+    }
+
+    fn class_declaration(&mut self) -> Result<()> {
+        self.consume(TokenType::Identifier, "Expect class name.".to_string())?;
+
+        let name_constant = self.identifier_constant(self.previous().lexeme.to_string())?;
+        self.declare_variable()?;
+
+        self.emit_bytes(OpCode::Class as u8, name_constant);
+        self.define_variable(name_constant);
+
+        self.consume(TokenType::LeftBrace, "Expect '{' before class body.".to_string())?;
+        self.consume(TokenType::RightBrace, "Expect '}' after class body.".to_string())?;
 
         Ok(())
     }
@@ -465,21 +481,20 @@ impl Parser<'_, '_, '_> {
     /// Parse anything with given precedence or higher.
     /// Precedence: `precedence` is not `Precedence::None`.
     fn parse_precedence(&mut self, precedence: Precedence) -> Result<()> {
-        let prev_precedence = self.precedence;
+        let prev_can_assign = self.can_assign;
         let result = self.parse_precedence_util(precedence);
-        self.precedence = prev_precedence;
+        self.can_assign = prev_can_assign;
         result
     }
 
     fn parse_precedence_util(&mut self, precedence: Precedence) -> Result<()> {
-        self.precedence = precedence;
+        self.can_assign = precedence <= Precedence::Assignment;
         self.advance()?;
         self.parse_prefix(self.previous().token_type)?;
 
         loop {
             let token_type = self.current().token_type;
             let infix_precedence = self.get_precedence(token_type);
-            self.precedence = infix_precedence;
 
             if precedence > infix_precedence {
                 // Stop parsing since the next token has lower precedence, or is not an infix operator at all
@@ -580,6 +595,20 @@ impl Parser<'_, '_, '_> {
         Ok(())
     }
 
+    fn dot(&mut self) -> Result<()> {
+        self.consume(TokenType::Identifier, "Expect property name after '.'.".to_string())?;
+        let name_constant = self.identifier_constant(self.previous().lexeme.to_string())?;
+
+        if self.can_assign && self.match_token(TokenType::Equal)? {
+            self.expression()?;
+            self.emit_bytes(OpCode::SetProperty as u8, name_constant);
+        } else {
+            self.emit_bytes(OpCode::GetProperty as u8, name_constant);
+        }
+
+        Ok(())
+    }
+
     fn grouping(&mut self) -> Result<()> {
         // Assume that '(' is already consumed
         self.expression()?;
@@ -662,7 +691,7 @@ impl Parser<'_, '_, '_> {
             }
         };
 
-        if self.precedence <= Precedence::Assignment && self.match_token(TokenType::Equal)? {
+        if self.can_assign && self.match_token(TokenType::Equal)? {
             self.expression()?;
             self.emit_bytes(set_op as u8, arg);
         } else {
